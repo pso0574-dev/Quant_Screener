@@ -1,14 +1,16 @@
 # streamlit_app.py
 # ---------------------------------------------------------
 # NASDAQ Growth Screener
-# Filters:
-#   - Revenue growth > threshold
-#   - ROIC rising
-#   - MDD > threshold
-#   - Large TAM sectors
+# - Revenue Growth YoY
+# - ROIC Trend
+# - MDD
+# - TAM Sector filter
+# - Price chart with MVA 50 / 200
+#
+# Install:
+#   pip install streamlit yfinance pandas numpy plotly
 #
 # Run:
-#   pip install streamlit yfinance pandas numpy plotly
 #   streamlit run streamlit_app.py
 # ---------------------------------------------------------
 
@@ -21,6 +23,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+
 # =========================================================
 # Page config
 # =========================================================
@@ -31,11 +34,11 @@ st.set_page_config(
 )
 
 st.title("📈 NASDAQ Growth Screener")
-st.caption("Revenue Growth + ROIC Trend + MDD + TAM Sector filter")
+st.caption("Revenue Growth + ROIC Trend + MDD + TAM Sector + MVA 50 / 200")
+
 
 # =========================================================
 # Universe
-# Fixed Nasdaq-100 style universe for stability
 # =========================================================
 NASDAQ_UNIVERSE = sorted(list(set([
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "AVGO", "TSLA",
@@ -51,9 +54,9 @@ NASDAQ_UNIVERSE = sorted(list(set([
     "SNOW", "NET", "SHOP", "ARM"
 ])))
 
+
 # =========================================================
-# TAM sector mapping
-# User can adjust / expand later
+# TAM mapping
 # =========================================================
 TAM_BUCKETS = {
     "AI / Semiconductors": [
@@ -83,11 +86,11 @@ TAM_BUCKETS = {
 
 TAM_ORDER = list(TAM_BUCKETS.keys())
 
-# Reverse map
 TICKER_TO_TAM = {}
 for tam_name, tickers in TAM_BUCKETS.items():
     for t in tickers:
         TICKER_TO_TAM[t] = tam_name
+
 
 # =========================================================
 # Sidebar controls
@@ -150,14 +153,16 @@ show_all = st.sidebar.checkbox("Show all screened stocks", value=False)
 
 refresh = st.sidebar.button("🔄 Refresh data")
 
+
 # =========================================================
-# Cache helpers
+# Cache
 # =========================================================
-TTL_SEC = 60 * 60 * 6  # 6 hours
+TTL_SEC = 60 * 60 * 6
 
 if refresh:
     st.cache_data.clear()
     st.success("Cache cleared. Data will be refreshed.")
+
 
 # =========================================================
 # Utility functions
@@ -170,6 +175,7 @@ def safe_float(x):
     except Exception:
         return np.nan
 
+
 def calc_mdd_from_close(close_series: pd.Series):
     if close_series is None or close_series.empty:
         return np.nan, np.nan, np.nan
@@ -180,27 +186,15 @@ def calc_mdd_from_close(close_series: pd.Series):
     peak_price = running_max.iloc[-1]
     return float(mdd * 100), float(current_dd * 100), float(peak_price)
 
-def pick_latest_valid_column(df: pd.DataFrame):
-    if df is None or df.empty:
-        return None
-    valid_cols = [c for c in df.columns if pd.notna(df[c]).sum() > 0]
-    if not valid_cols:
-        return None
-    return valid_cols[0]
 
 def get_revenue_growth_yoy(quarterly_income_stmt: pd.DataFrame):
     """
-    Uses quarterly total revenue if possible.
-    Need at least 5 quarters to compare latest quarter vs same quarter last year.
+    Compare latest quarter revenue vs same quarter last year.
     """
     if quarterly_income_stmt is None or quarterly_income_stmt.empty:
         return np.nan, []
 
-    possible_rows = [
-        "Total Revenue",
-        "Revenue",
-        "Operating Revenue"
-    ]
+    possible_rows = ["Total Revenue", "Revenue", "Operating Revenue"]
 
     revenue_row = None
     for r in possible_rows:
@@ -215,7 +209,6 @@ def get_revenue_growth_yoy(quarterly_income_stmt: pd.DataFrame):
     if len(s) < 5:
         return np.nan, list(s.values)
 
-    # yfinance usually returns latest quarter first
     latest = safe_float(s.iloc[0])
     prev_year_same_q = safe_float(s.iloc[4])
 
@@ -224,6 +217,7 @@ def get_revenue_growth_yoy(quarterly_income_stmt: pd.DataFrame):
 
     yoy = (latest / prev_year_same_q - 1.0) * 100
     return float(yoy), list(s.values)
+
 
 def get_balance_value(balance_sheet: pd.DataFrame, candidate_rows):
     if balance_sheet is None or balance_sheet.empty:
@@ -235,6 +229,7 @@ def get_balance_value(balance_sheet: pd.DataFrame, candidate_rows):
                 return safe_float(s.iloc[0])
     return np.nan
 
+
 def get_income_value(income_stmt: pd.DataFrame, candidate_rows):
     if income_stmt is None or income_stmt.empty:
         return np.nan
@@ -245,6 +240,7 @@ def get_income_value(income_stmt: pd.DataFrame, candidate_rows):
                 return safe_float(s.iloc[0])
     return np.nan
 
+
 def estimate_roic(financials: dict):
     """
     Approximate ROIC:
@@ -252,8 +248,6 @@ def estimate_roic(financials: dict):
 
     NOPAT ≈ EBIT * (1 - tax_rate)
     Invested Capital ≈ Total Equity + Total Debt - Cash
-
-    This is an approximation because Yahoo data is not perfectly standardized.
     """
     income_stmt = financials.get("income_stmt")
     balance_sheet = financials.get("balance_sheet")
@@ -268,7 +262,9 @@ def estimate_roic(financials: dict):
         "Total Debt", "Long Term Debt And Capital Lease Obligation", "Long Term Debt"
     ])
     cash = get_balance_value(balance_sheet, [
-        "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash"
+        "Cash And Cash Equivalents",
+        "Cash Cash Equivalents And Short Term Investments",
+        "Cash"
     ])
 
     if np.isnan(ebit):
@@ -296,24 +292,20 @@ def estimate_roic(financials: dict):
     roic = nopat / invested_capital * 100
     return float(roic)
 
+
 def estimate_roic_trend(quarterly_income_stmt: pd.DataFrame, balance_sheet: pd.DataFrame):
     """
-    Simpler trend proxy:
-    Compare latest approximate ROIC vs older one if possible.
-    Because yfinance time-series balance sheet consistency is limited,
-    we use a weak but practical approximation from available columns.
+    Compare latest approximate ROIC vs previous snapshot.
     """
     if quarterly_income_stmt is None or quarterly_income_stmt.empty:
         return np.nan, np.nan, False
 
-    # Need enough columns
     qcols = list(quarterly_income_stmt.columns)
     bcols = list(balance_sheet.columns) if balance_sheet is not None and not balance_sheet.empty else []
 
     if len(qcols) < 2 or len(bcols) < 2:
         return np.nan, np.nan, False
 
-    # Build two snapshots: latest and previous
     try:
         latest_income = quarterly_income_stmt[[qcols[0]]]
         prev_income = quarterly_income_stmt[[qcols[1]]]
@@ -337,40 +329,101 @@ def estimate_roic_trend(quarterly_income_stmt: pd.DataFrame, balance_sheet: pd.D
 
     return latest_roic, prev_roic, rising
 
+
+def calc_ma_signals(close: pd.Series):
+    if close is None or close.empty:
+        return {
+            "MVA50": np.nan,
+            "MVA200": np.nan,
+            "Price > MVA50": False,
+            "Price > MVA200": False,
+            "MVA50 > MVA200": False,
+            "Cross Signal": "N/A"
+        }
+
+    mva50 = close.rolling(50).mean()
+    mva200 = close.rolling(200).mean()
+
+    latest_close = safe_float(close.iloc[-1]) if len(close) > 0 else np.nan
+    latest_mva50 = safe_float(mva50.iloc[-1]) if len(mva50.dropna()) > 0 else np.nan
+    latest_mva200 = safe_float(mva200.iloc[-1]) if len(mva200.dropna()) > 0 else np.nan
+
+    price_gt_mva50 = False if np.isnan(latest_close) or np.isnan(latest_mva50) else latest_close > latest_mva50
+    price_gt_mva200 = False if np.isnan(latest_close) or np.isnan(latest_mva200) else latest_close > latest_mva200
+    mva50_gt_mva200 = False if np.isnan(latest_mva50) or np.isnan(latest_mva200) else latest_mva50 > latest_mva200
+
+    cross_signal = "N/A"
+    valid = pd.DataFrame({"mva50": mva50, "mva200": mva200}).dropna()
+    if len(valid) >= 2:
+        prev50 = valid["mva50"].iloc[-2]
+        prev200 = valid["mva200"].iloc[-2]
+        curr50 = valid["mva50"].iloc[-1]
+        curr200 = valid["mva200"].iloc[-1]
+
+        if prev50 <= prev200 and curr50 > curr200:
+            cross_signal = "Golden Cross"
+        elif prev50 >= prev200 and curr50 < curr200:
+            cross_signal = "Dead Cross"
+        else:
+            cross_signal = "No new cross"
+
+    return {
+        "MVA50": latest_mva50,
+        "MVA200": latest_mva200,
+        "Price > MVA50": price_gt_mva50,
+        "Price > MVA200": price_gt_mva200,
+        "MVA50 > MVA200": mva50_gt_mva200,
+        "Cross Signal": cross_signal
+    }
+
+
 def interpret_stock(row):
     notes = []
 
-    if row["Revenue Growth YoY %"] >= 40:
-        notes.append("very strong revenue momentum")
-    elif row["Revenue Growth YoY %"] >= 25:
-        notes.append("good revenue growth")
+    if pd.notna(row["Revenue Growth YoY %"]):
+        if row["Revenue Growth YoY %"] >= 40:
+            notes.append("very strong revenue momentum")
+        elif row["Revenue Growth YoY %"] >= 25:
+            notes.append("good revenue growth")
 
-    if row["ROIC Rising"]:
+    if bool(row["ROIC Rising"]):
         notes.append("capital efficiency improving")
 
-    if row["MDD %"] <= -50:
-        notes.append("deep correction from previous peak")
-    elif row["MDD %"] <= -30:
-        notes.append("meaningful pullback")
+    if pd.notna(row["MDD %"]):
+        if row["MDD %"] <= -50:
+            notes.append("deep correction from previous peak")
+        elif row["MDD %"] <= -30:
+            notes.append("meaningful pullback")
 
     if row["TAM Sector"] in ["AI / Semiconductors", "Cybersecurity", "Cloud / Data / Software"]:
         notes.append("large structural TAM")
+
+    if bool(row.get("Price > MVA200", False)):
+        notes.append("price above MVA200")
+    else:
+        if pd.notna(row.get("MVA200", np.nan)):
+            notes.append("price below MVA200")
+
+    if bool(row.get("MVA50 > MVA200", False)):
+        notes.append("medium-term trend stronger")
 
     if len(notes) == 0:
         return "mixed signals"
     return ", ".join(notes)
 
+
 # =========================================================
-# Data loading
+# Data download
 # =========================================================
 @st.cache_data(ttl=TTL_SEC, show_spinner=False)
 def download_price_data(ticker, period_years=3):
     end = datetime.today()
-    start = end - timedelta(days=365 * period_years + 10)
+    start = end - timedelta(days=365 * period_years + 20)
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
 
 @st.cache_data(ttl=TTL_SEC, show_spinner=False)
 def fetch_ticker_data(ticker):
@@ -402,7 +455,6 @@ def fetch_ticker_data(ticker):
     except Exception:
         annual_balance_sheet = pd.DataFrame()
 
-    # fallback if quarterly unavailable
     if quarterly_income_stmt is None or quarterly_income_stmt.empty:
         quarterly_income_stmt = annual_income_stmt.copy()
 
@@ -416,6 +468,7 @@ def fetch_ticker_data(ticker):
         "income_stmt": annual_income_stmt,
         "balance_sheet": annual_balance_sheet
     }
+
 
 def screen_one_ticker(ticker, years):
     try:
@@ -432,7 +485,6 @@ def screen_one_ticker(ticker, years):
         revenue_growth, _ = get_revenue_growth_yoy(qis)
         latest_roic, prev_roic, roic_rising = estimate_roic_trend(qis, qbs)
 
-        # Annual fallback if quarterly trend unavailable
         if np.isnan(latest_roic):
             latest_roic = estimate_roic({
                 "income_stmt": ais,
@@ -440,6 +492,8 @@ def screen_one_ticker(ticker, years):
             })
 
         mdd, current_dd, peak_price = calc_mdd_from_close(close)
+
+        ma = calc_ma_signals(close)
 
         market_cap = safe_float(info.get("marketCap"))
         market_cap_b = market_cap / 1e9 if not np.isnan(market_cap) else np.nan
@@ -449,17 +503,28 @@ def screen_one_ticker(ticker, years):
         industry = info.get("industry", "Unknown")
         tam_sector = TICKER_TO_TAM.get(ticker, "Other")
 
-        score = 0
+        score = 0.0
+
         if not np.isnan(revenue_growth):
             score += min(max(revenue_growth, 0), 100) * 0.35
+
         if not np.isnan(latest_roic):
             score += min(max(latest_roic, 0), 50) * 0.25
+
         if roic_rising:
             score += 10
+
         if not np.isnan(mdd):
             score += min(abs(mdd), 80) * 0.20
+
         if tam_sector in ["AI / Semiconductors", "Cybersecurity", "Cloud / Data / Software"]:
             score += 10
+
+        if ma["Price > MVA200"]:
+            score += 5
+
+        if ma["MVA50 > MVA200"]:
+            score += 5
 
         return {
             "Ticker": ticker,
@@ -475,6 +540,12 @@ def screen_one_ticker(ticker, years):
             "MDD %": mdd,
             "Current DD %": current_dd,
             "Peak Price": peak_price,
+            "MVA50": ma["MVA50"],
+            "MVA200": ma["MVA200"],
+            "Price > MVA50": ma["Price > MVA50"],
+            "Price > MVA200": ma["Price > MVA200"],
+            "MVA50 > MVA200": ma["MVA50 > MVA200"],
+            "Cross Signal": ma["Cross Signal"],
             "Score": score
         }
 
@@ -493,11 +564,18 @@ def screen_one_ticker(ticker, years):
             "MDD %": np.nan,
             "Current DD %": np.nan,
             "Peak Price": np.nan,
+            "MVA50": np.nan,
+            "MVA200": np.nan,
+            "Price > MVA50": False,
+            "Price > MVA200": False,
+            "MVA50 > MVA200": False,
+            "Cross Signal": "N/A",
             "Score": np.nan
         }
 
+
 # =========================================================
-# Main screening
+# Main
 # =========================================================
 run_button = st.button("Run Screener", type="primary")
 
@@ -523,12 +601,13 @@ if run_button:
 
     numeric_cols = [
         "Market Cap (B$)", "Revenue Growth YoY %", "ROIC Latest %",
-        "ROIC Previous %", "MDD %", "Current DD %", "Peak Price", "Score"
+        "ROIC Previous %", "MDD %", "Current DD %", "Peak Price",
+        "MVA50", "MVA200", "Score"
     ]
+
     for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Filter conditions
     screened = df.copy()
     screened = screened[screened["TAM Sector"].isin(tam_filter)]
     screened = screened[screened["Market Cap (B$)"] >= min_market_cap_b]
@@ -544,15 +623,14 @@ if run_button:
     elapsed = time.time() - start_time
     st.success(f"Done. {len(screened)} stocks matched in {elapsed:.1f} sec.")
 
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Universe Size", len(tickers))
-    col2.metric("Matched Stocks", len(screened))
-    col3.metric("Revenue Filter", f">{rev_growth_threshold}%")
-    col4.metric("MDD Filter", f">{mdd_threshold}%")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Universe Size", len(tickers))
+    c2.metric("Matched Stocks", len(screened))
+    c3.metric("Revenue Filter", f">{rev_growth_threshold}%")
+    c4.metric("MDD Filter", f">{mdd_threshold}%")
 
-    # Full screened table
     st.subheader("📋 Screened Results")
+
     if len(screened) == 0:
         st.info("No stocks matched all conditions. Try lowering the thresholds.")
     else:
@@ -562,43 +640,29 @@ if run_button:
             "Ticker", "Company", "TAM Sector", "Sector", "Industry",
             "Market Cap (B$)", "Revenue Growth YoY %", "ROIC Latest %",
             "ROIC Previous %", "ROIC Rising", "MDD %", "Current DD %",
-            "Score", "Interpretation"
+            "MVA50", "MVA200", "Price > MVA50", "Price > MVA200",
+            "MVA50 > MVA200", "Cross Signal", "Score", "Interpretation"
         ]
 
-        if show_all:
-            st.dataframe(
-                screened[display_cols].style.format({
-                    "Market Cap (B$)": "{:.1f}",
-                    "Revenue Growth YoY %": "{:.1f}",
-                    "ROIC Latest %": "{:.1f}",
-                    "ROIC Previous %": "{:.1f}",
-                    "MDD %": "{:.1f}",
-                    "Current DD %": "{:.1f}",
-                    "Score": "{:.1f}"
-                }),
-                use_container_width=True,
-                height=500
-            )
-        else:
-            st.dataframe(
-                screened.head(top_n)[display_cols].style.format({
-                    "Market Cap (B$)": "{:.1f}",
-                    "Revenue Growth YoY %": "{:.1f}",
-                    "ROIC Latest %": "{:.1f}",
-                    "ROIC Previous %": "{:.1f}",
-                    "MDD %": "{:.1f}",
-                    "Current DD %": "{:.1f}",
-                    "Score": "{:.1f}"
-                }),
-                use_container_width=True,
-                height=420
-            )
+        table_df = screened if show_all else screened.head(top_n)
 
-        # =====================================================
-        # Candidate charts
-        # =====================================================
+        st.dataframe(
+            table_df[display_cols].style.format({
+                "Market Cap (B$)": "{:.1f}",
+                "Revenue Growth YoY %": "{:.1f}",
+                "ROIC Latest %": "{:.1f}",
+                "ROIC Previous %": "{:.1f}",
+                "MDD %": "{:.1f}",
+                "Current DD %": "{:.1f}",
+                "MVA50": "{:.2f}",
+                "MVA200": "{:.2f}",
+                "Score": "{:.1f}"
+            }),
+            use_container_width=True,
+            height=500
+        )
+
         st.subheader("📊 Top Candidate Analysis")
-
         top_df = screened.head(top_n).copy()
 
         for _, row in top_df.iterrows():
@@ -620,39 +684,95 @@ if run_button:
                 continue
 
             close = price_df["Close"].dropna()
+            mva50 = close.rolling(50).mean()
+            mva200 = close.rolling(200).mean()
             run_max = close.cummax()
             dd = (close / run_max - 1.0) * 100
 
-            c1, c2 = st.columns(2)
+            latest_close = safe_float(close.iloc[-1]) if len(close) > 0 else np.nan
+            latest_mva50 = safe_float(mva50.iloc[-1]) if len(mva50.dropna()) > 0 else np.nan
+            latest_mva200 = safe_float(mva200.iloc[-1]) if len(mva200.dropna()) > 0 else np.nan
 
-            with c1:
+            trend_comment = []
+
+            if not np.isnan(latest_close) and not np.isnan(latest_mva50):
+                if latest_close > latest_mva50:
+                    trend_comment.append("price above MVA50")
+                else:
+                    trend_comment.append("price below MVA50")
+
+            if not np.isnan(latest_close) and not np.isnan(latest_mva200):
+                if latest_close > latest_mva200:
+                    trend_comment.append("price above MVA200")
+                else:
+                    trend_comment.append("price below MVA200")
+
+            if not np.isnan(latest_mva50) and not np.isnan(latest_mva200):
+                if latest_mva50 > latest_mva200:
+                    trend_comment.append("MVA50 above MVA200")
+                else:
+                    trend_comment.append("MVA50 below MVA200")
+
+            if row["Cross Signal"] != "N/A":
+                trend_comment.append(str(row["Cross Signal"]))
+
+            if trend_comment:
+                st.write("**MVA Signal:** " + ", ".join(trend_comment))
+
+            col_left, col_right = st.columns(2)
+
+            with col_left:
                 fig_price = go.Figure()
+
                 fig_price.add_trace(go.Scatter(
-                    x=close.index, y=close.values,
-                    mode="lines", name="Close"
+                    x=close.index,
+                    y=close.values,
+                    mode="lines",
+                    name="Close"
                 ))
+
                 fig_price.add_trace(go.Scatter(
-                    x=run_max.index, y=run_max.values,
-                    mode="lines", name="Rolling Peak"
+                    x=mva50.index,
+                    y=mva50.values,
+                    mode="lines",
+                    name="MVA 50"
                 ))
+
+                fig_price.add_trace(go.Scatter(
+                    x=mva200.index,
+                    y=mva200.values,
+                    mode="lines",
+                    name="MVA 200"
+                ))
+
+                fig_price.add_trace(go.Scatter(
+                    x=run_max.index,
+                    y=run_max.values,
+                    mode="lines",
+                    name="Rolling Peak"
+                ))
+
                 fig_price.update_layout(
-                    title=f"{ticker} Price vs Rolling Peak",
-                    height=350,
+                    title=f"{ticker} Price + MVA 50 / 200",
+                    height=360,
                     margin=dict(l=20, r=20, t=50, b=20),
                     xaxis_title="Date",
-                    yaxis_title="Price"
+                    yaxis_title="Price",
+                    legend=dict(orientation="h")
                 )
                 st.plotly_chart(fig_price, use_container_width=True)
 
-            with c2:
+            with col_right:
                 fig_dd = go.Figure()
                 fig_dd.add_trace(go.Scatter(
-                    x=dd.index, y=dd.values,
-                    mode="lines", name="Drawdown %"
+                    x=dd.index,
+                    y=dd.values,
+                    mode="lines",
+                    name="Drawdown %"
                 ))
                 fig_dd.update_layout(
                     title=f"{ticker} Drawdown from Previous Peak",
-                    height=350,
+                    height=360,
                     margin=dict(l=20, r=20, t=50, b=20),
                     xaxis_title="Date",
                     yaxis_title="Drawdown (%)"
@@ -661,20 +781,28 @@ if run_button:
 
             st.divider()
 
-    # =========================================================
-    # Full universe snapshot
-    # =========================================================
     st.subheader("🌐 Full Universe Snapshot")
     full_display = df.copy()
     full_display["Interpretation"] = full_display.apply(interpret_stock, axis=1)
+
+    full_cols = [
+        "Ticker", "Company", "TAM Sector", "Sector", "Industry",
+        "Market Cap (B$)", "Revenue Growth YoY %", "ROIC Latest %",
+        "ROIC Previous %", "ROIC Rising", "MDD %", "Current DD %",
+        "MVA50", "MVA200", "Price > MVA50", "Price > MVA200",
+        "MVA50 > MVA200", "Cross Signal", "Score", "Interpretation"
+    ]
+
     st.dataframe(
-        full_display.sort_values("Score", ascending=False).style.format({
+        full_display[full_cols].sort_values("Score", ascending=False).style.format({
             "Market Cap (B$)": "{:.1f}",
             "Revenue Growth YoY %": "{:.1f}",
             "ROIC Latest %": "{:.1f}",
             "ROIC Previous %": "{:.1f}",
             "MDD %": "{:.1f}",
             "Current DD %": "{:.1f}",
+            "MVA50": "{:.2f}",
+            "MVA200": "{:.2f}",
             "Score": "{:.1f}"
         }),
         use_container_width=True,
@@ -691,12 +819,16 @@ else:
     - improving ROIC
     - meaningful drawdown from prior peak
     - large TAM sectors
+    - price / trend confirmation with MVA 50 and MVA 200
+    """)
 
-    ### Practical use
-    This is useful for finding:
-    - growth stocks under correction
-    - recovering capital efficiency
-    - structurally strong industries
+    st.markdown("""
+    ### MVA interpretation
+    - **Price > MVA50**: short / medium-term trend stronger
+    - **Price > MVA200**: long-term trend stronger
+    - **MVA50 > MVA200**: medium-term trend stronger than long-term trend
+    - **Golden Cross**: MVA50 crossed above MVA200
+    - **Dead Cross**: MVA50 crossed below MVA200
     """)
 
     st.markdown("""

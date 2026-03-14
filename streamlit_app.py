@@ -1,514 +1,388 @@
-# -*- coding: utf-8 -*-
-# SPY / QQQ / SCHD Quant Screener
-# Run:
-#   streamlit run streamlit_app.py
+# streamlit_app.py
+# QQQ / SPY / SCHD Quant Analysis Dashboard
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
-import plotly.express as px
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
 st.set_page_config(
-    page_title="SPY QQQ SCHD Quant Screener",
+    page_title="ETF Quant Analyzer",
     page_icon="📊",
     layout="wide"
 )
 
 # =========================================================
-# SETTINGS
+# Settings
 # =========================================================
-ETF_UNIVERSE = {
-    "SPY": "SPDR S&P 500 ETF Trust",
-    "QQQ": "Invesco QQQ Trust",
-    "SCHD": "Schwab U.S. Dividend Equity ETF"
-}
-
-DEFAULT_START = "2018-01-01"
-
-st.title("📊 SPY / QQQ / SCHD Quant Screener")
-st.caption("Compare momentum, trend, volatility, drawdown, and relative strength")
+DEFAULT_TICKERS = ["QQQ", "SPY", "SCHD"]
+RISK_FREE_RATE = 0.02  # 2% assumption for Sharpe
 
 # =========================================================
-# SIDEBAR
+# Helpers
 # =========================================================
-st.sidebar.header("Settings")
-
-start_date = st.sidebar.date_input(
-    "Start date",
-    value=pd.to_datetime(DEFAULT_START)
-)
-
-benchmark = st.sidebar.selectbox(
-    "Relative benchmark",
-    options=["SPY", "QQQ", "SCHD"],
-    index=0
-)
-
-profile = st.sidebar.selectbox(
-    "Scoring profile",
-    options=["Balanced", "Aggressive", "Defensive", "Long-Term"],
-    index=0
-)
-
-show_normalized = st.sidebar.checkbox("Show normalized price chart", value=True)
-show_drawdown = st.sidebar.checkbox("Show drawdown chart", value=True)
-
-# Default weights by profile
-if profile == "Balanced":
-    default_weights = {
-        "mom_1m": 0.10,
-        "mom_3m": 0.15,
-        "mom_6m": 0.20,
-        "mom_12m": 0.20,
-        "trend": 0.15,
-        "sharpe": 0.10,
-        "low_vol": 0.05,
-        "low_mdd": 0.05
-    }
-elif profile == "Aggressive":
-    default_weights = {
-        "mom_1m": 0.15,
-        "mom_3m": 0.20,
-        "mom_6m": 0.20,
-        "mom_12m": 0.20,
-        "trend": 0.15,
-        "sharpe": 0.05,
-        "low_vol": 0.03,
-        "low_mdd": 0.02
-    }
-elif profile == "Defensive":
-    default_weights = {
-        "mom_1m": 0.05,
-        "mom_3m": 0.10,
-        "mom_6m": 0.15,
-        "mom_12m": 0.15,
-        "trend": 0.15,
-        "sharpe": 0.15,
-        "low_vol": 0.15,
-        "low_mdd": 0.10
-    }
-else:  # Long-Term
-    default_weights = {
-        "mom_1m": 0.03,
-        "mom_3m": 0.07,
-        "mom_6m": 0.20,
-        "mom_12m": 0.30,
-        "trend": 0.20,
-        "sharpe": 0.10,
-        "low_vol": 0.05,
-        "low_mdd": 0.05
-    }
-
-st.sidebar.markdown("### Factor Weights")
-weights = {}
-for k, v in default_weights.items():
-    weights[k] = st.sidebar.slider(
-        k, 0.0, 1.0, float(v), 0.01
-    )
-
-weight_sum = sum(weights.values())
-if weight_sum == 0:
-    st.error("At least one factor weight must be greater than 0.")
-    st.stop()
-
-weights = {k: v / weight_sum for k, v in weights.items()}
-
-# =========================================================
-# DATA LOADER
-# =========================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data(tickers, start):
-    data = yf.download(
+@st.cache_data
+def load_data(tickers, start_date, end_date):
+    df = yf.download(
         tickers=tickers,
-        start=start,
+        start=start_date,
+        end=end_date,
         auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-        threads=True
+        progress=False
     )
-    return data
 
-tickers = list(ETF_UNIVERSE.keys())
-raw = load_data(tickers, str(start_date))
+    if df.empty:
+        return pd.DataFrame()
 
-if raw.empty:
-    st.error("Failed to download data.")
-    st.stop()
+    # yfinance may return MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns.get_level_values(0):
+            prices = df["Close"].copy()
+        else:
+            # fallback: try Adj Close or first level
+            first_level = df.columns.get_level_values(0).unique().tolist()
+            chosen = "Adj Close" if "Adj Close" in first_level else first_level[0]
+            prices = df[chosen].copy()
+    else:
+        prices = df.copy()
 
-# =========================================================
-# HELPERS
-# =========================================================
-def get_close_volume(data, ticker):
-    close = data[ticker]["Close"].dropna()
-    volume = data[ticker]["Volume"].dropna()
-    return close, volume
+    prices = prices.dropna(how="all")
+    return prices
 
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    avg_up = up.ewm(alpha=1/period, adjust=False).mean()
-    avg_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_up / avg_down.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+def compute_metrics(price_df):
+    daily_ret = price_df.pct_change().dropna()
+    total_days = (price_df.index[-1] - price_df.index[0]).days
+    years = max(total_days / 365.25, 1e-9)
 
-def pct_return(series, days):
-    if len(series) <= days:
-        return np.nan
-    return series.iloc[-1] / series.iloc[-days - 1] - 1
+    metrics = {}
 
-def annualized_vol(returns):
-    return returns.std() * np.sqrt(252)
+    for ticker in price_df.columns:
+        px = price_df[ticker].dropna()
+        ret = daily_ret[ticker].dropna()
 
-def sharpe_proxy(returns):
-    vol = annualized_vol(returns)
-    if pd.isna(vol) or vol == 0:
-        return np.nan
-    return returns.mean() * 252 / vol
+        if len(px) < 30 or len(ret) < 20:
+            continue
 
-def max_drawdown(series):
-    roll_max = series.cummax()
-    dd = series / roll_max - 1.0
-    return dd.min()
+        cagr = (px.iloc[-1] / px.iloc[0]) ** (1 / years) - 1
+        ann_vol = ret.std() * np.sqrt(252)
+        sharpe = np.nan if ann_vol == 0 else (ret.mean() * 252 - RISK_FREE_RATE) / ann_vol
 
-def drawdown_series(series):
-    roll_max = series.cummax()
-    return series / roll_max - 1.0
+        running_max = px.cummax()
+        drawdown = px / running_max - 1
+        mdd = drawdown.min()
 
-def zscore_rank(s):
-    if s.nunique() <= 1:
+        ma50 = px.rolling(50).mean().iloc[-1]
+        ma200 = px.rolling(200).mean().iloc[-1] if len(px) >= 200 else np.nan
+        current = px.iloc[-1]
+
+        mom_1m = px.iloc[-1] / px.iloc[-22] - 1 if len(px) >= 22 else np.nan
+        mom_3m = px.iloc[-1] / px.iloc[-63] - 1 if len(px) >= 63 else np.nan
+        mom_6m = px.iloc[-1] / px.iloc[-126] - 1 if len(px) >= 126 else np.nan
+        mom_12m = px.iloc[-1] / px.iloc[-252] - 1 if len(px) >= 252 else np.nan
+
+        metrics[ticker] = {
+            "Last Price": current,
+            "CAGR": cagr,
+            "Volatility": ann_vol,
+            "Sharpe": sharpe,
+            "MDD": mdd,
+            "Above MA50 (%)": (current / ma50 - 1) if pd.notna(ma50) else np.nan,
+            "Above MA200 (%)": (current / ma200 - 1) if pd.notna(ma200) else np.nan,
+            "Momentum 1M": mom_1m,
+            "Momentum 3M": mom_3m,
+            "Momentum 6M": mom_6m,
+            "Momentum 12M": mom_12m,
+        }
+
+    return pd.DataFrame(metrics).T
+
+def normalize_series(s, higher_is_better=True):
+    s = s.astype(float)
+    valid = s.dropna()
+    if len(valid) == 0:
+        return pd.Series(np.nan, index=s.index)
+
+    min_v, max_v = valid.min(), valid.max()
+    if np.isclose(max_v, min_v):
         return pd.Series(50.0, index=s.index)
-    z = (s - s.mean()) / s.std(ddof=0)
-    score = 50 + 15 * z
-    return score.clip(0, 100)
 
-# =========================================================
-# FACTOR CALCULATION
-# =========================================================
-rows = []
-price_dict = {}
-drawdown_dict = {}
+    scaled = (s - min_v) / (max_v - min_v) * 100
+    if not higher_is_better:
+        scaled = 100 - scaled
+    return scaled
 
-for ticker in tickers:
-    close, volume = get_close_volume(raw, ticker)
+def compute_quant_score(metrics_df):
+    score_df = pd.DataFrame(index=metrics_df.index)
 
-    if len(close) < 220:
-        continue
+    score_df["Momentum 3M Score"] = normalize_series(metrics_df["Momentum 3M"], True)
+    score_df["Momentum 6M Score"] = normalize_series(metrics_df["Momentum 6M"], True)
+    score_df["Momentum 12M Score"] = normalize_series(metrics_df["Momentum 12M"], True)
+    score_df["Sharpe Score"] = normalize_series(metrics_df["Sharpe"], True)
+    score_df["Volatility Score"] = normalize_series(metrics_df["Volatility"], False)
+    score_df["MDD Score"] = normalize_series(metrics_df["MDD"], True)  # less negative is better
+    score_df["Trend Score"] = normalize_series(metrics_df["Above MA200 (%)"], True)
 
-    ret = close.pct_change().dropna()
+    score_df["Quant Score"] = (
+        score_df["Momentum 3M Score"] * 0.15 +
+        score_df["Momentum 6M Score"] * 0.20 +
+        score_df["Momentum 12M Score"] * 0.20 +
+        score_df["Sharpe Score"] * 0.20 +
+        score_df["Volatility Score"] * 0.10 +
+        score_df["MDD Score"] * 0.10 +
+        score_df["Trend Score"] * 0.05
+    )
 
-    price_dict[ticker] = close
-    drawdown_dict[ticker] = drawdown_series(close)
+    return score_df.round(2)
 
-    sma50 = close.rolling(50).mean().iloc[-1]
-    sma200 = close.rolling(200).mean().iloc[-1]
-    last_price = close.iloc[-1]
-
-    trend_raw = (
-        int(last_price > sma50) +
-        int(last_price > sma200) +
-        int(sma50 > sma200)
-    ) / 3.0
-
-    row = {
-        "Ticker": ticker,
-        "Name": ETF_UNIVERSE[ticker],
-        "Last": last_price,
-        "Return 1M": pct_return(close, 21),
-        "Return 3M": pct_return(close, 63),
-        "Return 6M": pct_return(close, 126),
-        "Return 12M": pct_return(close, 252),
-        "Vol 20D": ret.rolling(20).std().iloc[-1] * np.sqrt(252),
-        "Vol 60D": ret.rolling(60).std().iloc[-1] * np.sqrt(252),
-        "MDD Full": max_drawdown(close),
-        "MDD 1Y": max_drawdown(close.tail(252)),
-        "RSI14": calc_rsi(close, 14).iloc[-1],
-        "SMA50": sma50,
-        "SMA200": sma200,
-        "Trend Raw": trend_raw,
-        "Sharpe 1Y": sharpe_proxy(ret.tail(252)),
-        "Avg Dollar Vol 20D": (close * volume).rolling(20).mean().iloc[-1]
-    }
-    rows.append(row)
-
-factors = pd.DataFrame(rows).set_index("Ticker")
-
-if factors.empty:
-    st.error("Not enough data to calculate factors.")
-    st.stop()
-
-# Relative strength vs selected benchmark
-bench = price_dict[benchmark]
-rel_3m = {}
-rel_6m = {}
-rel_12m = {}
-
-for ticker in factors.index:
-    aligned = pd.concat([price_dict[ticker], bench], axis=1, join="inner").dropna()
-    aligned.columns = ["asset", "bench"]
-
-    def rel_ret(days):
-        if len(aligned) <= days:
-            return np.nan
-        asset_r = aligned["asset"].iloc[-1] / aligned["asset"].iloc[-days - 1] - 1
-        bench_r = aligned["bench"].iloc[-1] / aligned["bench"].iloc[-days - 1] - 1
-        return asset_r - bench_r
-
-    rel_3m[ticker] = rel_ret(63)
-    rel_6m[ticker] = rel_ret(126)
-    rel_12m[ticker] = rel_ret(252)
-
-factors["Rel 3M"] = pd.Series(rel_3m)
-factors["Rel 6M"] = pd.Series(rel_6m)
-factors["Rel 12M"] = pd.Series(rel_12m)
-
-# =========================================================
-# SCORING
-# =========================================================
-score_df = factors.copy()
-
-score_df["Score Mom 1M"] = zscore_rank(score_df["Return 1M"])
-score_df["Score Mom 3M"] = zscore_rank(score_df["Return 3M"])
-score_df["Score Mom 6M"] = zscore_rank(score_df["Return 6M"])
-score_df["Score Mom 12M"] = zscore_rank(score_df["Return 12M"])
-score_df["Score Trend"] = score_df["Trend Raw"] * 100
-score_df["Score Sharpe"] = zscore_rank(score_df["Sharpe 1Y"])
-score_df["Score Low Vol"] = zscore_rank(-score_df["Vol 60D"])
-score_df["Score Low MDD"] = zscore_rank(-score_df["MDD 1Y"].abs())
-
-score_df["Composite Score"] = (
-    weights["mom_1m"] * score_df["Score Mom 1M"] +
-    weights["mom_3m"] * score_df["Score Mom 3M"] +
-    weights["mom_6m"] * score_df["Score Mom 6M"] +
-    weights["mom_12m"] * score_df["Score Mom 12M"] +
-    weights["trend"] * score_df["Score Trend"] +
-    weights["sharpe"] * score_df["Score Sharpe"] +
-    weights["low_vol"] * score_df["Score Low Vol"] +
-    weights["low_mdd"] * score_df["Score Low MDD"]
-)
-
-score_df["Rank"] = score_df["Composite Score"].rank(
-    ascending=False, method="dense"
-).astype(int)
-
-# =========================================================
-# DISPLAY FORMAT
-# =========================================================
-table_cols = [
-    "Rank", "Name", "Last",
-    "Return 1M", "Return 3M", "Return 6M", "Return 12M",
-    "Rel 3M", "Rel 6M", "Rel 12M",
-    "Vol 20D", "Vol 60D",
-    "MDD 1Y", "MDD Full",
-    "RSI14", "Sharpe 1Y", "Composite Score"
-]
-
-table_df = score_df[table_cols].sort_values("Rank").copy()
-
-def fmt_pct(x):
+def format_pct(x):
     return f"{x:.2%}" if pd.notna(x) else "-"
 
-def fmt_num(x):
-    return f"{x:,.2f}" if pd.notna(x) else "-"
+def format_num(x):
+    return f"{x:.2f}" if pd.notna(x) else "-"
 
-styled_df = table_df.copy()
-pct_cols = [
-    "Return 1M", "Return 3M", "Return 6M", "Return 12M",
-    "Rel 3M", "Rel 6M", "Rel 12M",
-    "Vol 20D", "Vol 60D", "MDD 1Y", "MDD Full"
-]
-num_cols = ["Last", "RSI14", "Sharpe 1Y", "Composite Score"]
+def generate_signal(row):
+    signals = []
 
-for c in pct_cols:
-    styled_df[c] = styled_df[c].map(fmt_pct)
-for c in num_cols:
-    styled_df[c] = styled_df[c].map(fmt_num)
+    if pd.notna(row["Above MA200 (%)"]):
+        if row["Above MA200 (%)"] > 0:
+            signals.append("Bullish Trend")
+        else:
+            signals.append("Below MA200")
 
-# =========================================================
-# TOP SUMMARY
-# =========================================================
-top_ticker = table_df.index[0]
-top_name = ETF_UNIVERSE[top_ticker]
+    if pd.notna(row["Momentum 6M"]):
+        if row["Momentum 6M"] > 0:
+            signals.append("Positive 6M Momentum")
+        else:
+            signals.append("Weak 6M Momentum")
 
-colA, colB, colC, colD = st.columns(4)
-colA.metric("Top Ranked", top_ticker)
-colB.metric("Benchmark", benchmark)
-colC.metric("Profile", profile)
-colD.metric("Universe Size", len(table_df))
+    if pd.notna(row["Sharpe"]):
+        if row["Sharpe"] > 0.8:
+            signals.append("Strong Risk-Adjusted Return")
+        elif row["Sharpe"] < 0.3:
+            signals.append("Low Risk-Adjusted Return")
+
+    return " | ".join(signals)
 
 # =========================================================
-# TABS
+# Sidebar
 # =========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏆 Screener",
-    "📈 Price",
-    "📉 Drawdown",
-    "🧪 Factor Heatmap",
-    "📘 Interpretation"
-])
+st.title("📊 ETF Quant Analyzer")
+st.caption("QQQ / SPY / SCHD based quantitative comparison dashboard")
 
-with tab1:
-    st.subheader("Ranking Table")
-    st.dataframe(styled_df, use_container_width=True)
-    st.success(f"Current top-ranked ETF: {top_ticker} - {top_name}")
+st.sidebar.header("Settings")
 
-    c1, c2 = st.columns(2)
+end_date = datetime.today().date()
+start_date = st.sidebar.date_input(
+    "Start Date",
+    value=end_date - timedelta(days=365 * 5)
+)
+end_date = st.sidebar.date_input(
+    "End Date",
+    value=end_date
+)
 
-    with c1:
-        bar_df = table_df.reset_index()[["Ticker", "Composite Score"]]
-        fig_bar = px.bar(
-            bar_df,
-            x="Ticker",
-            y="Composite Score",
-            title="Composite Score"
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+tickers_input = st.sidebar.text_input(
+    "Tickers",
+    value="QQQ,SPY,SCHD"
+)
 
-    with c2:
-        scatter_df = score_df.reset_index()
-        fig_scatter = px.scatter(
-            scatter_df,
-            x="Vol 60D",
-            y="Return 12M",
-            text="Ticker",
-            size="Composite Score",
-            hover_data=["Name", "Sharpe 1Y", "MDD 1Y"],
-            title="12M Return vs 60D Volatility"
-        )
-        fig_scatter.update_traces(textposition="top center")
-        st.plotly_chart(fig_scatter, use_container_width=True)
+tickers = [x.strip().upper() for x in tickers_input.split(",") if x.strip()]
 
-with tab2:
-    st.subheader("Normalized Price Comparison")
-    if show_normalized:
-        base100 = pd.DataFrame()
-        for ticker, series in price_dict.items():
-            s = series.dropna()
-            base100[ticker] = s / s.iloc[0] * 100
+if len(tickers) == 0:
+    st.warning("Please enter at least one ticker.")
+    st.stop()
 
-        fig_line = go.Figure()
-        for ticker in base100.columns:
-            fig_line.add_trace(go.Scatter(
-                x=base100.index,
-                y=base100[ticker],
-                mode="lines",
-                name=ticker
-            ))
+# =========================================================
+# Data Load
+# =========================================================
+prices = load_data(tickers, start_date, end_date)
 
-        fig_line.update_layout(
-            title="Growth of 100",
-            xaxis_title="Date",
-            yaxis_title="Indexed Price"
-        )
-        st.plotly_chart(fig_line, use_container_width=True)
+if prices.empty:
+    st.error("No price data loaded. Please check ticker symbols or date range.")
+    st.stop()
 
-        returns_compare = pd.DataFrame({
-            "Ticker": list(factors.index),
-            "1M": factors["Return 1M"].values,
-            "3M": factors["Return 3M"].values,
-            "6M": factors["Return 6M"].values,
-            "12M": factors["Return 12M"].values
-        }).set_index("Ticker")
+# Ensure only valid columns
+prices = prices.dropna(axis=1, how="all")
 
-        st.dataframe(
-            returns_compare.style.format("{:.2%}"),
-            use_container_width=True
-        )
+if prices.shape[1] == 0:
+    st.error("No valid ticker data available.")
+    st.stop()
 
-with tab3:
-    st.subheader("Drawdown Comparison")
-    if show_drawdown:
-        dd_df = pd.DataFrame(drawdown_dict)
+returns = prices.pct_change().dropna()
+cum_returns = (1 + returns).cumprod()
 
-        fig_dd = go.Figure()
-        for ticker in dd_df.columns:
-            fig_dd.add_trace(go.Scatter(
-                x=dd_df.index,
-                y=dd_df[ticker],
-                mode="lines",
-                name=ticker
-            ))
+metrics_df = compute_metrics(prices)
+score_df = compute_quant_score(metrics_df)
+summary_df = metrics_df.join(score_df["Quant Score"]).sort_values("Quant Score", ascending=False)
+summary_df["Signal"] = summary_df.apply(generate_signal, axis=1)
 
-        fig_dd.update_layout(
-            title="Historical Drawdown",
-            xaxis_title="Date",
-            yaxis_title="Drawdown"
-        )
-        st.plotly_chart(fig_dd, use_container_width=True)
+# =========================================================
+# Top Summary
+# =========================================================
+st.subheader("1. Quant Ranking")
 
-        dd_summary = factors[["MDD 1Y", "MDD Full"]].copy()
-        st.dataframe(dd_summary.style.format("{:.2%}"), use_container_width=True)
+rank_table = summary_df.copy()
 
-with tab4:
-    st.subheader("Factor Heatmap")
+display_rank = pd.DataFrame(index=rank_table.index)
+display_rank["Last Price"] = rank_table["Last Price"].map(format_num)
+display_rank["CAGR"] = rank_table["CAGR"].map(format_pct)
+display_rank["Volatility"] = rank_table["Volatility"].map(format_pct)
+display_rank["Sharpe"] = rank_table["Sharpe"].map(format_num)
+display_rank["MDD"] = rank_table["MDD"].map(format_pct)
+display_rank["Momentum 3M"] = rank_table["Momentum 3M"].map(format_pct)
+display_rank["Momentum 6M"] = rank_table["Momentum 6M"].map(format_pct)
+display_rank["Momentum 12M"] = rank_table["Momentum 12M"].map(format_pct)
+display_rank["Above MA200"] = rank_table["Above MA200 (%)"].map(format_pct)
+display_rank["Quant Score"] = rank_table["Quant Score"].map(format_num)
+display_rank["Signal"] = rank_table["Signal"]
 
-    heat_cols = [
-        "Score Mom 1M", "Score Mom 3M", "Score Mom 6M", "Score Mom 12M",
-        "Score Trend", "Score Sharpe", "Score Low Vol", "Score Low MDD",
-        "Composite Score"
-    ]
-    heat_df = score_df[heat_cols].sort_values("Composite Score", ascending=False)
+st.dataframe(display_rank, use_container_width=True)
 
-    fig_heat = px.imshow(
-        heat_df,
-        text_auto=".1f",
-        aspect="auto",
-        title="Factor Scores"
-    )
-    st.plotly_chart(fig_heat, use_container_width=True)
+winner = summary_df.index[0]
+st.success(f"Top ranked ETF by current Quant Score: **{winner}**")
 
-with tab5:
-    st.subheader("How to Read This")
+# =========================================================
+# Price Chart
+# =========================================================
+st.subheader("2. Price Chart")
 
-    st.markdown(f"""
-### ETF Character Differences
-- **SPY**: broad US large-cap exposure, core market beta
-- **QQQ**: stronger growth/tech tilt, usually higher upside and higher volatility
-- **SCHD**: dividend + quality tilt, often stronger downside defense than QQQ
+fig_price = go.Figure()
+for col in prices.columns:
+    fig_price.add_trace(go.Scatter(
+        x=prices.index,
+        y=prices[col],
+        mode="lines",
+        name=col
+    ))
 
-### Quant Interpretation
-- **High 1M / 3M / 6M / 12M return**  
-  = stronger momentum
+fig_price.update_layout(
+    height=500,
+    xaxis_title="Date",
+    yaxis_title="Price",
+    legend_title="Ticker"
+)
+st.plotly_chart(fig_price, use_container_width=True)
 
-- **Price > SMA50 > SMA200**  
-  = strong trend structure
+# =========================================================
+# Cumulative Return Chart
+# =========================================================
+st.subheader("3. Cumulative Return")
 
-- **Low Vol 60D**  
-  = lower recent risk
+fig_cum = go.Figure()
+for col in cum_returns.columns:
+    fig_cum.add_trace(go.Scatter(
+        x=cum_returns.index,
+        y=cum_returns[col],
+        mode="lines",
+        name=col
+    ))
 
-- **Low MDD 1Y**  
-  = better downside control
+fig_cum.update_layout(
+    height=500,
+    xaxis_title="Date",
+    yaxis_title="Growth of $1",
+    legend_title="Ticker"
+)
+st.plotly_chart(fig_cum, use_container_width=True)
 
-- **High Sharpe 1Y**  
-  = better return per unit of risk
+# =========================================================
+# Drawdown Chart
+# =========================================================
+st.subheader("4. Drawdown Analysis")
 
-- **Positive Relative Return vs {benchmark}**  
-  = outperforming selected benchmark
+fig_dd = go.Figure()
+for col in prices.columns:
+    rolling_max = prices[col].cummax()
+    dd = prices[col] / rolling_max - 1
 
-### Practical Use
-- When **QQQ** ranks first:
-  growth / risk-on regime 가능성
+    fig_dd.add_trace(go.Scatter(
+        x=dd.index,
+        y=dd,
+        mode="lines",
+        name=col
+    ))
 
-- When **SPY** ranks first:
-  broad market leadership, more balanced regime 가능성
+fig_dd.update_layout(
+    height=500,
+    xaxis_title="Date",
+    yaxis_title="Drawdown",
+    legend_title="Ticker"
+)
+st.plotly_chart(fig_dd, use_container_width=True)
 
-- When **SCHD** ranks first:
-  defensive / income / quality preference 강화 가능성
+# =========================================================
+# Momentum Comparison
+# =========================================================
+st.subheader("5. Momentum Comparison")
 
-### Important
-This is a **screening and regime-reading tool**, not a guaranteed buy/sell signal.
-Use it together with:
-- position sizing
-- rebalancing rules
-- macro/liquidity context
-- drawdown control
+momentum_cols = ["Momentum 1M", "Momentum 3M", "Momentum 6M", "Momentum 12M"]
+mom_display = metrics_df[momentum_cols].copy()
+
+for c in momentum_cols:
+    mom_display[c] = mom_display[c].map(format_pct)
+
+st.dataframe(mom_display, use_container_width=True)
+
+# =========================================================
+# Moving Average / Trend
+# =========================================================
+st.subheader("6. Trend Filter (MA50 / MA200)")
+
+trend_display = pd.DataFrame(index=metrics_df.index)
+trend_display["Above MA50"] = metrics_df["Above MA50 (%)"].map(format_pct)
+trend_display["Above MA200"] = metrics_df["Above MA200 (%)"].map(format_pct)
+
+st.dataframe(trend_display, use_container_width=True)
+
+# =========================================================
+# Score Breakdown
+# =========================================================
+st.subheader("7. Quant Score Breakdown")
+
+score_display = score_df.copy()
+for c in score_display.columns:
+    score_display[c] = score_display[c].map(format_num)
+
+st.dataframe(score_display, use_container_width=True)
+
+# =========================================================
+# Interpretation
+# =========================================================
+st.subheader("8. Interpretation Guide")
+
+st.markdown("""
+**How to read this dashboard**
+- **CAGR**: Long-term annualized growth rate
+- **Volatility**: Annualized risk level
+- **Sharpe**: Risk-adjusted return (higher is generally better)
+- **MDD**: Maximum drawdown (less negative is better)
+- **Momentum 3M/6M/12M**: Medium/long trend strength
+- **Above MA200**: Long-term trend filter
+
+**Basic Quant logic**
+- Prefer ETFs with:
+  - higher momentum
+  - higher Sharpe
+  - shallower drawdown
+  - lower volatility
+  - price above MA200
 """)
 
-st.markdown("---")
-st.caption(
-    f"Universe: {', '.join(tickers)} | Benchmark: {benchmark} | "
-    f"Top ranked: {top_ticker} | Data source: Yahoo Finance via yfinance"
-)
+# =========================================================
+# Latest Snapshot
+# =========================================================
+st.subheader("9. Latest Snapshot")
+
+for ticker in summary_df.index:
+    row = summary_df.loc[ticker]
+    with st.container():
+        st.markdown(f"### {ticker}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Quant Score", format_num(row["Quant Score"]))
+        c2.metric("CAGR", format_pct(row["CAGR"]))
+        c3.metric("Sharpe", format_num(row["Sharpe"]))
+        c4.metric("MDD", format_pct(row["MDD"]))
+        st.write(f"Signal: {row['Signal']}")
+        st.divider()

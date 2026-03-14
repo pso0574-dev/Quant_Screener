@@ -1,773 +1,382 @@
 # streamlit_app.py
-# NASDAQ Quant Screener
-# Focus:
-# - Cheap now view using Discount from ATH / Rolling MDD / ROE / PE / Revenue Growth
-# - Refresh live data button
-# - Visual Analysis with tab-separated charts
-# - Top 10 options including MDD-based selection
-#
-# Run:
-#   pip install streamlit yfinance pandas numpy plotly
-#   streamlit run streamlit_app.py
-
-from __future__ import annotations
-
-import time
-from datetime import datetime
+# pip install streamlit yfinance pandas numpy plotly
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
 import yfinance as yf
+import streamlit as st
+import plotly.express as px
+from datetime import datetime, timedelta
 
+st.set_page_config(page_title="Nasdaq-100 Quant Strategy Dashboard", layout="wide")
 
-# =========================================================
-# Page Config
-# =========================================================
-st.set_page_config(
-    page_title="NASDAQ Quant Screener",
-    page_icon="📉",
-    layout="wide"
-)
-
-st.title("📉 NASDAQ Quant Screener")
-st.caption("Undervaluation view using Discount from ATH / Rolling MDD + ROE + valuation")
-
+st.title("Nasdaq-100 Quant Strategy Dashboard")
+st.caption("ROE / MDD based undervalued stock screening with strategy tabs")
 
 # =========================================================
-# Stable Nasdaq-100 Universe
+# 1) NASDAQ-100 ticker universe
 # =========================================================
+# For production stability, many people keep a local CSV backup.
+# Here we use a maintained list directly in code for simplicity.
+
 NASDAQ100_TICKERS = [
-    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
-    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AXON", "AZN", "BIIB", "BKNG",
-    "CDNS", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD", "CSCO", "CSX", "CTAS",
-    "CTSH", "DASH", "DDOG", "DXCM", "EA", "EXC", "FANG", "FAST", "FTNT", "GEHC",
-    "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX", "INTC", "INTU", "ISRG", "KDP",
-    "KHC", "KLAC", "LIN", "LRCX", "LULU", "MAR", "MCHP", "MDLZ", "MELI", "META",
-    "MNST", "MRVL", "MSFT", "MSTR", "MU", "NFLX", "NVDA", "NXPI", "ODFL", "ON",
-    "ORLY", "PANW", "PAYX", "PCAR", "PDD", "PEP", "PLTR", "PYPL", "QCOM", "REGN",
-    "ROP", "ROST", "SBUX", "SNPS", "TEAM", "TMUS", "TSLA", "TTD", "TTWO", "TXN",
-    "VRSK", "VRTX", "WBD", "WDAY", "XEL", "ZS"
+    "AAPL","ABNB","ADBE","ADI","ADP","ADSK","AEP","AMAT","AMD","AMGN",
+    "AMZN","ANSS","ARM","ASML","AVGO","AXON","AZN","BIIB","BKNG","CDNS",
+    "CEG","CHTR","CMCSA","COST","CPRT","CRWD","CSCO","CSX","CTAS","CTSH",
+    "DASH","DDOG","DXCM","EA","EXC","FANG","FAST","FTNT","GEHC","GFS",
+    "GILD","GOOG","GOOGL","HON","IDXX","INTC","INTU","ISRG","KDP","KHC",
+    "KLAC","LIN","LRCX","LULU","MAR","MCHP","MDLZ","MELI","META","MNST",
+    "MRVL","MSFT","MU","NFLX","NVDA","ODFL","ON","ORLY","PANW","PAYX",
+    "PCAR","PDD","PEP","PLTR","PYPL","QCOM","REGN","ROP","ROST","SBUX",
+    "SNPS","TEAM","TMUS","TSLA","TTD","TTWO","TXN","VRSK","VRTX","WBD",
+    "WDAY","XEL","ZS"
 ]
 
-DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "META", "AMZN", "NVDA", "AVGO", "NFLX", "TSLA", "AMD"]
-
+# Some data vendors may return BRK.B style issues differently, but Nasdaq-100 mostly avoids that.
+universe = NASDAQ100_TICKERS
 
 # =========================================================
-# Helper Functions
+# 2) Sidebar
 # =========================================================
-def safe_float(x):
-    try:
-        if x is None:
-            return np.nan
-        if isinstance(x, str) and x.strip() == "":
-            return np.nan
-        return float(x)
-    except Exception:
-        return np.nan
+st.sidebar.header("Settings")
+period = st.sidebar.selectbox("Price lookback", ["1y", "2y", "3y", "5y"], index=1)
+top_n = st.sidebar.slider("Top N", 5, 30, 10)
+min_roe = st.sidebar.slider("Minimum ROE (%)", 0, 40, 10)
+min_mktcap_b = st.sidebar.slider("Minimum Market Cap ($B)", 0, 500, 10)
+refresh = st.sidebar.button("Refresh Data")
 
-
-def pct_or_nan(x):
-    x = safe_float(x)
-    if np.isnan(x):
-        return np.nan
-    return x * 100.0
-
-
-def human_num(x):
-    if pd.isna(x):
-        return "N/A"
-    x = float(x)
-    absx = abs(x)
-    if absx >= 1_000_000_000_000:
-        return f"{x / 1_000_000_000_000:.2f}T"
-    if absx >= 1_000_000_000:
-        return f"{x / 1_000_000_000:.2f}B"
-    if absx >= 1_000_000:
-        return f"{x / 1_000_000:.2f}M"
-    return f"{x:,.0f}"
-
-
-def fmt_pct(x):
-    return "N/A" if pd.isna(x) else f"{x:.1f}%"
-
-
-def fmt_num(x):
-    return "N/A" if pd.isna(x) else f"{x:.2f}"
-
-
-def label_cheapness(discount_pct: float, roe_pct: float) -> str:
-    if np.isnan(discount_pct):
-        return "N/A"
-    if discount_pct >= 40 and roe_pct >= 15:
-        return "Very Cheap"
-    if discount_pct >= 30 and roe_pct >= 12:
-        return "Cheap"
-    if discount_pct >= 20 and roe_pct >= 10:
-        return "Watchlist"
-    if discount_pct >= 10:
-        return "Normal Pullback"
-    return "Near High"
-
-
-def normalize_rank(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
-    s = series.copy()
-    valid = s.dropna()
-    out = pd.Series(np.nan, index=s.index, dtype=float)
-
-    if len(valid) == 0:
-        return out
-    if len(valid) == 1:
-        out.loc[valid.index] = 50.0
-        return out
-
-    ranks = valid.rank(ascending=not higher_is_better, method="average")
-    scores = 100.0 * (len(valid) - ranks) / (len(valid) - 1)
-    out.loc[valid.index] = scores
-    return out
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_price_history(tickers: list[str], period_years: int) -> pd.DataFrame:
-    period = f"{period_years}y"
+# =========================================================
+# 3) Helpers
+# =========================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_price_data(tickers, period="2y"):
     data = yf.download(
         tickers=tickers,
         period=period,
-        interval="1d",
         auto_adjust=True,
+        progress=False,
         group_by="ticker",
         threads=True,
-        progress=False
     )
     return data
 
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_snapshot_data(tickers: list[str]) -> dict:
-    result = {}
-
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fundamentals(tickers):
+    rows = []
     for t in tickers:
         try:
-            tk = yf.Ticker(t)
-            info = tk.info or {}
-            fast_info = tk.fast_info if hasattr(tk, "fast_info") else {}
+            info = yf.Ticker(t).info
+            roe = info.get("returnOnEquity", np.nan)
+            market_cap = info.get("marketCap", np.nan)
+            trailing_pe = info.get("trailingPE", np.nan)
+            forward_pe = info.get("forwardPE", np.nan)
+            gross_margin = info.get("grossMargins", np.nan)
+            operating_margin = info.get("operatingMargins", np.nan)
+            revenue_growth = info.get("revenueGrowth", np.nan)
+            debt_to_equity = info.get("debtToEquity", np.nan)
+            fcf = info.get("freeCashflow", np.nan)
 
-            result[t] = {
-                "shortName": info.get("shortName", t),
-                "sector": info.get("sector", ""),
-                "industry": info.get("industry", ""),
-                "marketCap": safe_float(info.get("marketCap")),
-                "trailingPE": safe_float(info.get("trailingPE")),
-                "forwardPE": safe_float(info.get("forwardPE")),
-                "priceToBook": safe_float(info.get("priceToBook")),
-                "roe_pct": pct_or_nan(info.get("returnOnEquity")),
-                "roa_pct": pct_or_nan(info.get("returnOnAssets")),
-                "grossMargins_pct": pct_or_nan(info.get("grossMargins")),
-                "operatingMargins_pct": pct_or_nan(info.get("operatingMargins")),
-                "profitMargins_pct": pct_or_nan(info.get("profitMargins")),
-                "revenueGrowth_pct": pct_or_nan(info.get("revenueGrowth")),
-                "debtToEquity": safe_float(info.get("debtToEquity")),
-                "currentPrice": safe_float(info.get("currentPrice", fast_info.get("lastPrice", np.nan))),
-            }
+            rows.append({
+                "Ticker": t,
+                "ROE": roe * 100 if pd.notna(roe) else np.nan,
+                "MarketCap_B": market_cap / 1e9 if pd.notna(market_cap) else np.nan,
+                "TrailingPE": trailing_pe,
+                "ForwardPE": forward_pe,
+                "GrossMargin": gross_margin * 100 if pd.notna(gross_margin) else np.nan,
+                "OperatingMargin": operating_margin * 100 if pd.notna(operating_margin) else np.nan,
+                "RevenueGrowth": revenue_growth * 100 if pd.notna(revenue_growth) else np.nan,
+                "DebtToEquity": debt_to_equity,
+                "FCF_B": fcf / 1e9 if pd.notna(fcf) else np.nan,
+            })
         except Exception:
-            result[t] = {
-                "shortName": t,
-                "sector": "",
-                "industry": "",
-                "marketCap": np.nan,
-                "trailingPE": np.nan,
-                "forwardPE": np.nan,
-                "priceToBook": np.nan,
-                "roe_pct": np.nan,
-                "roa_pct": np.nan,
-                "grossMargins_pct": np.nan,
-                "operatingMargins_pct": np.nan,
-                "profitMargins_pct": np.nan,
-                "revenueGrowth_pct": np.nan,
-                "debtToEquity": np.nan,
-                "currentPrice": np.nan,
-            }
+            rows.append({
+                "Ticker": t,
+                "ROE": np.nan,
+                "MarketCap_B": np.nan,
+                "TrailingPE": np.nan,
+                "ForwardPE": np.nan,
+                "GrossMargin": np.nan,
+                "OperatingMargin": np.nan,
+                "RevenueGrowth": np.nan,
+                "DebtToEquity": np.nan,
+                "FCF_B": np.nan,
+            })
+    return pd.DataFrame(rows)
 
-        time.sleep(0.03)
-
-    return result
-
-
-def get_close_series(data: pd.DataFrame, ticker: str) -> pd.Series:
-    if isinstance(data.columns, pd.MultiIndex):
-        if ticker in data.columns.get_level_values(0):
-            df_t = data[ticker]
-            for col in ["Close", "Adj Close"]:
-                if col in df_t.columns:
-                    s = df_t[col].dropna()
-                    if len(s) > 0:
-                        return s
-    else:
-        for col in ["Close", "Adj Close"]:
-            if col in data.columns:
-                s = data[col].dropna()
-                if len(s) > 0:
-                    return s
-
-    return pd.Series(dtype=float)
-
-
-def compute_price_metrics(price_s: pd.Series) -> dict:
-    if price_s.empty:
-        return {
-            "current": np.nan,
-            "ath": np.nan,
-            "discount_from_ath_pct": np.nan,
-            "rolling_mdd_pct": np.nan,
-            "mva50_gap_pct": np.nan,
-            "mva200_gap_pct": np.nan,
-            "ytd_return_pct": np.nan,
-            "ret_1y_pct": np.nan,
-        }
-
-    current = float(price_s.iloc[-1])
-    ath = float(price_s.max())
-    discount = (ath - current) / ath * 100 if ath > 0 else np.nan
-
-    running_max = price_s.cummax()
-    drawdown = (price_s / running_max - 1.0) * 100.0
-    rolling_mdd = float(drawdown.min())
-
-    ma50 = price_s.rolling(50).mean().iloc[-1]
-    ma200 = price_s.rolling(200).mean().iloc[-1]
-
-    mva50_gap = (current / ma50 - 1.0) * 100 if pd.notna(ma50) and ma50 != 0 else np.nan
-    mva200_gap = (current / ma200 - 1.0) * 100 if pd.notna(ma200) and ma200 != 0 else np.nan
-
-    year_start = pd.Timestamp(datetime(price_s.index[-1].year, 1, 1))
-    ytd_base = price_s[price_s.index >= year_start]
-    ytd_return = (current / ytd_base.iloc[0] - 1.0) * 100 if len(ytd_base) > 0 else np.nan
-
-    ret_1y = np.nan
-    if len(price_s) >= 252:
-        ret_1y = (current / price_s.iloc[-252] - 1.0) * 100
-
-    return {
-        "current": current,
-        "ath": ath,
-        "discount_from_ath_pct": discount,
-        "rolling_mdd_pct": rolling_mdd,
-        "mva50_gap_pct": mva50_gap,
-        "mva200_gap_pct": mva200_gap,
-        "ytd_return_pct": ytd_return,
-        "ret_1y_pct": ret_1y,
-    }
-
-
-def build_screener_df(
-    tickers: list[str],
-    price_data: pd.DataFrame,
-    snap: dict,
-    w_roe: float,
-    w_discount: float,
-    w_pe: float,
-    w_growth: float,
-    min_roe: float,
-    min_discount: float,
-    max_pe: float
-) -> pd.DataFrame:
+def compute_mdd_and_momentum(price_df, tickers):
     rows = []
-
     for t in tickers:
-        s = get_close_series(price_data, t)
-        p = compute_price_metrics(s)
-        info = snap.get(t, {})
+        try:
+            s = price_df[t]["Close"].dropna() if isinstance(price_df.columns, pd.MultiIndex) else price_df["Close"].dropna()
+            if len(s) < 60:
+                continue
 
-        row = {
-            "Ticker": t,
-            "Name": info.get("shortName", t),
-            "Sector": info.get("sector", ""),
-            "Industry": info.get("industry", ""),
-            "MarketCap": info.get("marketCap", np.nan),
-            "Price": p["current"],
-            "ATH": p["ath"],
-            "DiscountFromATH_pct": p["discount_from_ath_pct"],
-            "RollingMDD_pct": p["rolling_mdd_pct"],
-            "ROE_pct": info.get("roe_pct", np.nan),
-            "ROA_pct": info.get("roa_pct", np.nan),
-            "GrossMargin_pct": info.get("grossMargins_pct", np.nan),
-            "OperatingMargin_pct": info.get("operatingMargins_pct", np.nan),
-            "ProfitMargin_pct": info.get("profitMargins_pct", np.nan),
-            "RevenueGrowth_pct": info.get("revenueGrowth_pct", np.nan),
-            "TrailingPE": info.get("trailingPE", np.nan),
-            "ForwardPE": info.get("forwardPE", np.nan),
-            "PBR": info.get("priceToBook", np.nan),
-            "DebtToEquity": info.get("debtToEquity", np.nan),
-            "MVA50Gap_pct": p["mva50_gap_pct"],
-            "MVA200Gap_pct": p["mva200_gap_pct"],
-            "YTD_pct": p["ytd_return_pct"],
-            "Ret1Y_pct": p["ret_1y_pct"],
-        }
-        row["CheapnessLabel"] = label_cheapness(row["DiscountFromATH_pct"], row["ROE_pct"])
-        rows.append(row)
+            roll_max = s.cummax()
+            dd = (s / roll_max - 1.0) * 100
+            mdd = dd.min()
 
-    df = pd.DataFrame(rows)
+            ret_6m = (s.iloc[-1] / s.iloc[max(0, len(s)-126)] - 1.0) * 100 if len(s) > 126 else np.nan
+            ret_3m = (s.iloc[-1] / s.iloc[max(0, len(s)-63)] - 1.0) * 100 if len(s) > 63 else np.nan
 
-    df["ROE_score"] = normalize_rank(df["ROE_pct"], higher_is_better=True)
-    df["Discount_score"] = normalize_rank(df["DiscountFromATH_pct"], higher_is_better=True)
+            ma50 = s.rolling(50).mean().iloc[-1]
+            ma200 = s.rolling(200).mean().iloc[-1] if len(s) >= 200 else np.nan
+            dist_200ma = ((s.iloc[-1] / ma200) - 1.0) * 100 if pd.notna(ma200) and ma200 != 0 else np.nan
 
-    pe_for_score = df["TrailingPE"].where(df["TrailingPE"] > 0, np.nan)
-    df["PE_score"] = normalize_rank(pe_for_score, higher_is_better=False)
+            vol_1y = s.pct_change().dropna().std() * np.sqrt(252) * 100
 
-    df["Growth_score"] = normalize_rank(df["RevenueGrowth_pct"], higher_is_better=True)
+            rows.append({
+                "Ticker": t,
+                "Price": s.iloc[-1],
+                "MDD": mdd,
+                "Momentum_6M": ret_6m,
+                "Momentum_3M": ret_3m,
+                "Dist_200MA": dist_200ma,
+                "Volatility_1Y": vol_1y,
+            })
+        except Exception:
+            pass
 
-    df["QuantScore"] = (
-        w_roe * df["ROE_score"].fillna(0)
-        + w_discount * df["Discount_score"].fillna(0)
-        + w_pe * df["PE_score"].fillna(0)
-        + w_growth * df["Growth_score"].fillna(0)
+    return pd.DataFrame(rows)
+
+def pct_rank_high(series):
+    return series.rank(pct=True, ascending=True)
+
+def pct_rank_low(series):
+    return 1 - series.rank(pct=True, ascending=True)
+
+def safe_fill(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan)
+    return df
+
+def build_scores(df):
+    df = df.copy()
+    df = safe_fill(df, df.columns)
+
+    # favorable-high metrics
+    df["r_ROE"] = pct_rank_high(df["ROE"])
+    df["r_GrossMargin"] = pct_rank_high(df["GrossMargin"])
+    df["r_OpMargin"] = pct_rank_high(df["OperatingMargin"])
+    df["r_RevenueGrowth"] = pct_rank_high(df["RevenueGrowth"])
+    df["r_Mom6"] = pct_rank_high(df["Momentum_6M"])
+    df["r_FCF"] = pct_rank_high(df["FCF_B"])
+
+    # favorable-low metrics
+    # MDD is more attractive when more negative, e.g. -30% cheaper than -8%
+    df["r_MDD"] = pct_rank_low(df["MDD"])
+    df["r_Debt"] = pct_rank_low(df["DebtToEquity"])
+    df["r_Vol"] = pct_rank_low(df["Volatility_1Y"])
+    df["r_PE"] = pct_rank_low(df["ForwardPE"].fillna(df["TrailingPE"]))
+
+    # Strategy scores
+    df["Score_ROE_MDD"] = 0.60 * df["r_ROE"] + 0.40 * df["r_MDD"]
+
+    df["Score_Quality_Pullback"] = (
+        0.30 * df["r_ROE"] +
+        0.20 * df["r_GrossMargin"] +
+        0.15 * df["r_OpMargin"] +
+        0.20 * df["r_MDD"] +
+        0.15 * df["r_Debt"]
     )
 
-    df["PassFilter"] = (
-        (df["ROE_pct"].fillna(-999) >= min_roe) &
-        (df["DiscountFromATH_pct"].fillna(-999) >= min_discount) &
-        (
-            df["TrailingPE"].isna() |
-            ((df["TrailingPE"] > 0) & (df["TrailingPE"] <= max_pe))
-        )
+    df["Score_Recovery_Momentum"] = (
+        0.30 * df["r_ROE"] +
+        0.30 * df["r_MDD"] +
+        0.25 * df["r_Mom6"] +
+        0.15 * df["r_RevenueGrowth"]
     )
 
-    df = df.sort_values(
-        ["PassFilter", "QuantScore", "ROE_pct"],
-        ascending=[False, False, False]
-    ).reset_index(drop=True)
+    df["Score_LowVol_Pullback"] = (
+        0.30 * df["r_ROE"] +
+        0.30 * df["r_MDD"] +
+        0.25 * df["r_Vol"] +
+        0.15 * df["r_PE"]
+    )
 
     return df
 
-
-def draw_relative_chart(price_data: pd.DataFrame, tickers: list[str]) -> go.Figure:
-    fig = go.Figure()
-
-    for t in tickers:
-        s = get_close_series(price_data, t)
-        if s.empty:
-            continue
-        rebased = s / s.iloc[0] * 100
-        fig.add_trace(
-            go.Scatter(
-                x=rebased.index,
-                y=rebased.values,
-                mode="lines",
-                name=t
-            )
-        )
-
-    fig.update_layout(
-        title="Relative Price Performance (Base = 100)",
-        xaxis_title="Date",
-        yaxis_title="Indexed Price",
-        height=550,
-        margin=dict(l=30, r=30, t=60, b=30),
-        legend_title="Ticker"
-    )
-    return fig
-
-
-def draw_drawdown_chart(price_data: pd.DataFrame, tickers: list[str]) -> go.Figure:
-    fig = go.Figure()
-
-    for t in tickers:
-        s = get_close_series(price_data, t)
-        if s.empty:
-            continue
-        dd = (s / s.cummax() - 1.0) * 100.0
-        fig.add_trace(
-            go.Scatter(
-                x=dd.index,
-                y=dd.values,
-                mode="lines",
-                name=t
-            )
-        )
-
-    fig.update_layout(
-        title="Drawdown vs Previous Peak (%)",
-        xaxis_title="Date",
-        yaxis_title="Drawdown %",
-        height=550,
-        margin=dict(l=30, r=30, t=60, b=30),
-        legend_title="Ticker"
-    )
-    return fig
-
-
-# =========================================================
-# Top Refresh Button
-# =========================================================
-top_col1, top_col2 = st.columns([1, 5])
-
-with top_col1:
-    if st.button("🔄 Refresh Live Data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-with top_col2:
-    st.caption("Manual refresh for latest market and fundamental data")
-
-
-# =========================================================
-# Sidebar
-# =========================================================
-st.sidebar.header("Settings")
-
-universe_mode = st.sidebar.selectbox(
-    "Universe",
-    ["NASDAQ-100", "Custom List"],
-    index=0
-)
-
-if universe_mode == "NASDAQ-100":
-    universe = NASDAQ100_TICKERS
-else:
-    custom = st.sidebar.text_area(
-        "Custom tickers (comma-separated)",
-        value="AAPL,MSFT,GOOGL,META,AMZN,NVDA,AVGO,NFLX,TSLA,AMD"
-    )
-    universe = [x.strip().upper() for x in custom.split(",") if x.strip()]
-
-history_years = st.sidebar.slider("Price history window (years)", 1, 10, 5)
-min_roe = st.sidebar.slider("Minimum ROE (%)", -20, 60, 10)
-min_discount = st.sidebar.slider("Minimum discount from ATH (%)", 0, 80, 20)
-max_pe = st.sidebar.slider("Maximum PE", 5, 100, 40)
-top_n = st.sidebar.slider("Top results", 5, 50, 20)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Scoring Weights")
-
-w_roe = st.sidebar.slider("ROE weight", 0.0, 1.0, 0.35, 0.05)
-w_discount = st.sidebar.slider("Discount/MDD weight", 0.0, 1.0, 0.35, 0.05)
-w_pe = st.sidebar.slider("PE weight", 0.0, 1.0, 0.20, 0.05)
-w_growth = st.sidebar.slider("Revenue growth weight", 0.0, 1.0, 0.10, 0.05)
-
-weight_sum = w_roe + w_discount + w_pe + w_growth
-if weight_sum == 0:
-    st.sidebar.error("At least one scoring weight must be greater than 0.")
-    st.stop()
-
-w_roe /= weight_sum
-w_discount /= weight_sum
-w_pe /= weight_sum
-w_growth /= weight_sum
-
-st.sidebar.markdown("---")
-if st.sidebar.button("🔄 Refresh Live Data", use_container_width=True):
-    st.cache_data.clear()
-    st.rerun()
-
-
-# =========================================================
-# Guard
-# =========================================================
-if not universe:
-    st.warning("Please provide at least one ticker.")
-    st.stop()
-
-
-# =========================================================
-# Data Load
-# =========================================================
-with st.spinner("Loading price and fundamental data..."):
-    price_data = load_price_history(universe, history_years)
-    snap = load_snapshot_data(universe)
-    df = build_screener_df(
-        tickers=universe,
-        price_data=price_data,
-        snap=snap,
-        w_roe=w_roe,
-        w_discount=w_discount,
-        w_pe=w_pe,
-        w_growth=w_growth,
-        min_roe=min_roe,
-        min_discount=min_discount,
-        max_pe=max_pe
-    )
-
-last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-st.success(f"Last updated: {last_updated}")
-
-
-# =========================================================
-# Summary Metrics
-# =========================================================
-passed = df[df["PassFilter"]].copy()
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Universe Size", f"{len(df)}")
-c2.metric("Passed Filter", f"{len(passed)}")
-c3.metric("Best Quant Score", fmt_num(df["QuantScore"].max()))
-c4.metric(
-    "Avg Discount (Passed)",
-    fmt_pct(passed["DiscountFromATH_pct"].mean() if len(passed) else np.nan)
-)
-
-
-# =========================================================
-# Main Tabs
-# =========================================================
-tab1, tab2, tab3 = st.tabs(["Screener", "Visual Analysis", "Methodology"])
-
-
-# =========================================================
-# Tab 1: Screener
-# =========================================================
-with tab1:
-    st.subheader("Top Quant Ideas")
-
-    show_pass_only = st.toggle("Show only filtered stocks", value=True)
-
-    work = passed.copy() if show_pass_only else df.copy()
-    work = work.head(top_n).copy()
-
-    display_cols = [
-        "Ticker", "Name", "Sector", "MarketCap", "Price", "ATH",
-        "DiscountFromATH_pct", "RollingMDD_pct", "ROE_pct", "RevenueGrowth_pct",
-        "TrailingPE", "ForwardPE", "PBR", "DebtToEquity", "MVA50Gap_pct",
-        "MVA200Gap_pct", "QuantScore", "CheapnessLabel", "PassFilter"
+def top_table(df, score_col, top_n=10):
+    cols = [
+        "Ticker", "ROE", "MDD", "Momentum_6M", "Dist_200MA",
+        "Volatility_1Y", "MarketCap_B", "ForwardPE", "TrailingPE",
+        "RevenueGrowth", "GrossMargin", "DebtToEquity", score_col
     ]
-
-    shown = work[display_cols].copy()
-    shown["MarketCap"] = shown["MarketCap"].apply(human_num)
-
-    st.dataframe(
-        shown,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Price": st.column_config.NumberColumn(format="%.2f"),
-            "ATH": st.column_config.NumberColumn(format="%.2f"),
-            "DiscountFromATH_pct": st.column_config.NumberColumn("Discount from ATH %", format="%.1f"),
-            "RollingMDD_pct": st.column_config.NumberColumn("Rolling MDD %", format="%.1f"),
-            "ROE_pct": st.column_config.NumberColumn("ROE %", format="%.1f"),
-            "RevenueGrowth_pct": st.column_config.NumberColumn("Revenue Growth %", format="%.1f"),
-            "TrailingPE": st.column_config.NumberColumn("Trailing PE", format="%.2f"),
-            "ForwardPE": st.column_config.NumberColumn("Forward PE", format="%.2f"),
-            "PBR": st.column_config.NumberColumn("P/B", format="%.2f"),
-            "DebtToEquity": st.column_config.NumberColumn("Debt/Equity", format="%.2f"),
-            "MVA50Gap_pct": st.column_config.NumberColumn("vs MA50 %", format="%.1f"),
-            "MVA200Gap_pct": st.column_config.NumberColumn("vs MA200 %", format="%.1f"),
-            "QuantScore": st.column_config.ProgressColumn("Quant Score", min_value=0, max_value=100, format="%.1f"),
-        }
-    )
-
-    if len(work) > 0:
-        best = work.iloc[0]
-        st.info(
-            f"Top idea now: {best['Ticker']} | "
-            f"Discount from ATH: {fmt_pct(best['DiscountFromATH_pct'])} | "
-            f"ROE: {fmt_pct(best['ROE_pct'])} | "
-            f"PE: {fmt_num(best['TrailingPE'])} | "
-            f"Label: {best['CheapnessLabel']}"
-        )
-
-    csv_bytes = shown.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download screener CSV",
-        data=csv_bytes,
-        file_name="nasdaq_quant_screener.csv",
-        mime="text/csv"
-    )
-
+    cols = [c for c in cols if c in df.columns]
+    out = df.sort_values(score_col, ascending=False)[cols].head(top_n).copy()
+    return out
 
 # =========================================================
-# Tab 2: Visual Analysis
+# 4) Load data
 # =========================================================
+if refresh:
+    st.cache_data.clear()
+
+with st.spinner("Loading Nasdaq-100 data..."):
+    price_data = load_price_data(universe, period=period)
+    funda = load_fundamentals(universe)
+    tech = compute_mdd_and_momentum(price_data, universe)
+
+df = funda.merge(tech, on="Ticker", how="inner")
+
+# basic filters
+df = df[
+    (df["MarketCap_B"].fillna(0) >= min_mktcap_b) &
+    (df["ROE"].fillna(-999) >= min_roe)
+].copy()
+
+df = build_scores(df)
+
+st.subheader("Filtered Universe")
+st.write(f"Number of stocks after filter: **{len(df)}**")
+
+# =========================================================
+# 5) Tabs
+# =========================================================
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Overview",
+    "ROE + MDD",
+    "Quality + Pullback",
+    "Recovery Momentum",
+    "Low Vol Pullback"
+])
+
+with tab1:
+    st.markdown("""
+    ### Overview
+    This dashboard uses the **Nasdaq-100 universe** and compares several quant styles for finding
+    **undervalued but fundamentally strong stocks**.
+
+    **Main idea**
+    - **ROE**: quality / profitability
+    - **MDD**: how much the stock is down from its previous peak
+    - **Momentum**: whether recovery has started
+    - **Volatility**: whether price behavior is relatively stable
+    """)
+
+    best = top_table(df, "Score_ROE_MDD", top_n)
+    st.dataframe(best, use_container_width=True)
+
+    fig = px.scatter(
+        df,
+        x="MDD",
+        y="ROE",
+        size="MarketCap_B",
+        color="Score_ROE_MDD",
+        hover_name="Ticker",
+        title="Nasdaq-100: ROE vs MDD"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 with tab2:
-    st.subheader("Visual Analysis")
+    st.markdown("""
+    ### Strategy 1: ROE + MDD
+    **Goal:** Find high-quality companies that are currently in a significant drawdown.
 
-    selection_mode = st.selectbox(
-        "Universe for visual analysis",
-        [
-            "Top 10 by Quant Score",
-            "Top 10 by Discount from ATH",
-            "Top 10 by Rolling MDD",
-            "Passed Filter",
-            "Manual Selection"
-        ],
-        index=0
+    **Interpretation**
+    - High **ROE** = good business quality
+    - Deep **MDD** = possibly discounted price
+
+    Good for investors looking for **quality on sale**.
+    """)
+
+    out = top_table(df, "Score_ROE_MDD", top_n)
+    st.dataframe(out, use_container_width=True)
+
+    fig = px.scatter(
+        df.sort_values("Score_ROE_MDD", ascending=False),
+        x="MDD",
+        y="ROE",
+        color="Score_ROE_MDD",
+        hover_name="Ticker",
+        title="ROE + MDD Strategy"
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-    top_k = st.slider("Number of stocks", 5, 20, 10)
-    candidate_df = df.copy()
-
-    use_roe_filter = st.checkbox("Apply ROE filter to MDD-based selection", value=True)
-
-    if use_roe_filter:
-        candidate_df = candidate_df[candidate_df["ROE_pct"].fillna(-999) >= min_roe].copy()
-
-    if selection_mode == "Top 10 by Quant Score":
-        selected_df = candidate_df.sort_values(
-            ["QuantScore", "ROE_pct"],
-            ascending=[False, False]
-        ).head(top_k)
-
-    elif selection_mode == "Top 10 by Discount from ATH":
-        selected_df = candidate_df.sort_values(
-            ["DiscountFromATH_pct", "QuantScore"],
-            ascending=[False, False]
-        ).head(top_k)
-
-    elif selection_mode == "Top 10 by Rolling MDD":
-        # More negative means deeper drawdown
-        selected_df = candidate_df.sort_values(
-            ["RollingMDD_pct", "QuantScore"],
-            ascending=[True, False]
-        ).head(top_k)
-
-    elif selection_mode == "Passed Filter":
-        selected_df = df[df["PassFilter"]].sort_values(
-            ["QuantScore", "DiscountFromATH_pct"],
-            ascending=[False, False]
-        ).head(top_k)
-
-    else:
-        selected_df = df.copy()
-
-    if selection_mode == "Manual Selection":
-        selected = st.multiselect(
-            "Select tickers",
-            options=df["Ticker"].tolist(),
-            default=DEFAULT_TICKERS[:5]
-        )
-    else:
-        st.markdown("### Candidate List")
-        st.dataframe(
-            selected_df[[
-                "Ticker", "Name", "Sector", "DiscountFromATH_pct",
-                "RollingMDD_pct", "ROE_pct", "TrailingPE",
-                "RevenueGrowth_pct", "QuantScore", "CheapnessLabel"
-            ]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "DiscountFromATH_pct": st.column_config.NumberColumn("Discount from ATH %", format="%.1f"),
-                "RollingMDD_pct": st.column_config.NumberColumn("Rolling MDD %", format="%.1f"),
-                "ROE_pct": st.column_config.NumberColumn("ROE %", format="%.1f"),
-                "TrailingPE": st.column_config.NumberColumn("Trailing PE", format="%.2f"),
-                "RevenueGrowth_pct": st.column_config.NumberColumn("Revenue Growth %", format="%.1f"),
-                "QuantScore": st.column_config.ProgressColumn("Quant Score", min_value=0, max_value=100, format="%.1f"),
-            }
-        )
-
-        selected = st.multiselect(
-            "Select tickers for visual analysis",
-            options=selected_df["Ticker"].tolist(),
-            default=selected_df["Ticker"].tolist()[:5]
-        )
-
-    if not selected:
-        st.warning("Please select at least one ticker.")
-    else:
-        vtab1, vtab2, vtab3 = st.tabs(
-            ["Relative Price Performance", "Drawdown vs Previous Peak", "Single Ticker Detail"]
-        )
-
-        with vtab1:
-            st.plotly_chart(
-                draw_relative_chart(price_data, selected),
-                use_container_width=True
-            )
-
-        with vtab2:
-            st.plotly_chart(
-                draw_drawdown_chart(price_data, selected),
-                use_container_width=True
-            )
-
-        with vtab3:
-            selected_one = st.selectbox("Single ticker detail", selected, index=0)
-            s = get_close_series(price_data, selected_one)
-
-            if not s.empty:
-                ma50 = s.rolling(50).mean()
-                ma200 = s.rolling(200).mean()
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name="Price"))
-                fig.add_trace(go.Scatter(x=ma50.index, y=ma50.values, mode="lines", name="MA50"))
-                fig.add_trace(go.Scatter(x=ma200.index, y=ma200.values, mode="lines", name="MA200"))
-                fig.update_layout(
-                    title=f"{selected_one} Price with Moving Averages",
-                    xaxis_title="Date",
-                    yaxis_title="Price",
-                    height=550,
-                    margin=dict(l=30, r=30, t=60, b=30)
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-                row = df[df["Ticker"] == selected_one].iloc[0]
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Discount from ATH", fmt_pct(row["DiscountFromATH_pct"]))
-                m2.metric("Rolling MDD", fmt_pct(row["RollingMDD_pct"]))
-                m3.metric("ROE", fmt_pct(row["ROE_pct"]))
-                m4.metric("Quant Score", fmt_num(row["QuantScore"]))
-
-                st.markdown(
-                    f"""
-**{selected_one} summary**
-
-- Cheapness label: **{row['CheapnessLabel']}**
-- Discount from ATH: **{fmt_pct(row['DiscountFromATH_pct'])}**
-- Rolling MDD ({history_years}Y window): **{fmt_pct(row['RollingMDD_pct'])}**
-- ROE: **{fmt_pct(row['ROE_pct'])}**
-- Trailing PE: **{fmt_num(row['TrailingPE'])}**
-- Forward PE: **{fmt_num(row['ForwardPE'])}**
-- Revenue growth: **{fmt_pct(row['RevenueGrowth_pct'])}**
-- Price vs MA50: **{fmt_pct(row['MVA50Gap_pct'])}**
-- Price vs MA200: **{fmt_pct(row['MVA200Gap_pct'])}**
-- YTD return: **{fmt_pct(row['YTD_pct'])}**
-- 1Y return: **{fmt_pct(row['Ret1Y_pct'])}**
-                    """
-                )
-
-
-# =========================================================
-# Tab 3: Methodology
-# =========================================================
 with tab3:
-    st.subheader("Methodology")
+    st.markdown("""
+    ### Strategy 2: Quality + Pullback
+    **Goal:** Prefer strong businesses with healthy margins, reasonable balance sheet,
+    and a meaningful pullback from prior highs.
 
-    st.markdown(
-        """
-### 1. What this screener means by "cheap now"
-This app does **not** define cheapness only by low PE.
+    **Uses**
+    - ROE
+    - Gross Margin
+    - Operating Margin
+    - Debt to Equity
+    - MDD
 
-It combines:
-- **ROE**: stronger business quality
-- **Discount from ATH**: how far current price is below peak
-- **Rolling MDD**: worst drawdown inside the selected history window
-- **PE**: valuation sanity check
-- **Revenue growth**: optional growth support
+    This is a more **fundamental quality-focused** version.
+    """)
 
-### 2. Main formulas
-- **Discount from ATH %** = `(ATH - Current Price) / ATH × 100`
-- **Drawdown %** = `(Price / Running Peak - 1) × 100`
-- **Rolling MDD %** = minimum drawdown over the selected window
+    out = top_table(df, "Score_Quality_Pullback", top_n)
+    st.dataframe(out, use_container_width=True)
 
-### 3. Interpretation
-- High ROE + large discount from ATH + reasonable PE  
-  → potentially attractive
-- Large drawdown but low or negative ROE  
-  → possible value trap
-- High ROE but near ATH  
-  → great company, but not necessarily cheap now
-
-### 4. Practical filter idea
-A simple rule:
-- ROE ≥ 10~15%
-- Discount from ATH ≥ 20~30%
-- PE not excessively high
-- Revenue growth still positive
-
-### 5. Notes
-- Some fundamentals can be missing or delayed.
-- PE can be less meaningful for unstable or negative earnings.
-- This is a ranking tool, not an automatic buy signal.
-        """
+    fig = px.bar(
+        out,
+        x="Ticker",
+        y="Score_Quality_Pullback",
+        title="Top Nasdaq-100 Stocks: Quality + Pullback"
     )
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    st.markdown("""
+    ### Strategy 3: Recovery Momentum
+    **Goal:** Find stocks that were hit hard, but are showing signs of recovery.
+
+    **Uses**
+    - ROE
+    - MDD
+    - 6M Momentum
+    - Revenue Growth
+
+    This helps avoid stocks that are simply cheap for a bad reason.
+    """)
+
+    out = top_table(df, "Score_Recovery_Momentum", top_n)
+    st.dataframe(out, use_container_width=True)
+
+    fig = px.scatter(
+        df,
+        x="MDD",
+        y="Momentum_6M",
+        color="Score_Recovery_Momentum",
+        size="MarketCap_B",
+        hover_name="Ticker",
+        title="Recovery Momentum Strategy"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab5:
+    st.markdown("""
+    ### Strategy 4: Low Vol Pullback
+    **Goal:** Find quality stocks in drawdown, but with relatively lower volatility.
+
+    **Uses**
+    - ROE
+    - MDD
+    - Volatility
+    - PE
+
+    Useful when you want a more **stable pullback strategy**.
+    """)
+
+    out = top_table(df, "Score_LowVol_Pullback", top_n)
+    st.dataframe(out, use_container_width=True)
+
+    fig = px.scatter(
+        df,
+        x="Volatility_1Y",
+        y="MDD",
+        color="Score_LowVol_Pullback",
+        hover_name="Ticker",
+        title="Low Volatility Pullback Strategy"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# =========================================================
+# 6) Raw data
+# =========================================================
+with st.expander("Show raw merged data"):
+    st.dataframe(df.sort_values("Score_ROE_MDD", ascending=False), use_container_width=True)

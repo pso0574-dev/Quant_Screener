@@ -1,6 +1,12 @@
 # streamlit_app.py
 # NASDAQ Quant Screener
-# Horizontal main tabs + MVA (Moving Average Analysis)
+# Horizontal main tabs + MVA + Relative Price + MDD
+#
+# Install:
+#   pip install streamlit yfinance pandas numpy plotly
+#
+# Run:
+#   streamlit run streamlit_app.py
 
 from __future__ import annotations
 
@@ -9,8 +15,8 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
@@ -20,13 +26,13 @@ warnings.filterwarnings("ignore")
 # Page Config
 # =========================================================
 st.set_page_config(
-    page_title="NASDAQ Quant Screener with MVA",
+    page_title="NASDAQ Quant Screener",
     page_icon="📈",
     layout="wide"
 )
 
 st.title("📈 NASDAQ Quant Screener")
-st.caption("Horizontal tabs + MVA-based price valuation analysis")
+st.caption("Horizontal tabs + MVA + Relative Price + MDD analysis")
 
 # =========================================================
 # Universe
@@ -40,15 +46,16 @@ CANDIDATES = [
 DEFAULT_TOP_N = 10
 
 # =========================================================
-# Sidebar settings
+# Sidebar
 # =========================================================
 st.sidebar.header("Settings")
 top_n = st.sidebar.slider("Top N by Market Cap", 5, 15, DEFAULT_TOP_N, 1)
 refresh_btn = st.sidebar.button("🔄 Refresh Market Data", use_container_width=True)
 show_only_undervalued = st.sidebar.checkbox("Show only Undervalued Quality", value=False)
+chart_period = st.sidebar.selectbox("Chart Period", ["6mo", "1y", "2y"], index=1)
 
 # =========================================================
-# Helper functions
+# Helpers
 # =========================================================
 def safe_get(d: dict, key: str, default=np.nan):
     try:
@@ -67,6 +74,12 @@ def safe_div(a, b):
         return np.nan
 
 
+def safe_div_series(a: pd.Series, b: pd.Series) -> pd.Series:
+    out = a / b
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
 def minmax_score(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").astype(float)
     s_min = s.min(skipna=True)
@@ -75,9 +88,9 @@ def minmax_score(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     if pd.isna(s_min) or pd.isna(s_max) or s_max == s_min:
         out = pd.Series(np.full(len(s), 50.0), index=s.index)
     else:
-        out = 100 * (s - s_min) / (s_max - s_min)
+        out = 100.0 * (s - s_min) / (s_max - s_min)
 
-    return out if higher_is_better else (100 - out)
+    return out if higher_is_better else (100.0 - out)
 
 
 def median_fill(series: pd.Series) -> pd.Series:
@@ -95,6 +108,7 @@ def get_price_history(ticker: str, period: str = "2y") -> pd.DataFrame:
         if hist.empty:
             return pd.DataFrame()
         hist = hist.reset_index()
+        hist["Date"] = pd.to_datetime(hist["Date"]).dt.tz_localize(None)
         return hist
     except Exception:
         return pd.DataFrame()
@@ -113,13 +127,82 @@ def add_moving_averages(hist: pd.DataFrame) -> pd.DataFrame:
     df["Dev_MA50"] = safe_div_series(df["Close"] - df["MA50"], df["MA50"])
     df["Dev_MA200"] = safe_div_series(df["Close"] - df["MA200"], df["MA200"])
 
+    roll_max = df["Close"].cummax()
+    df["Drawdown"] = safe_div_series(df["Close"], roll_max) - 1.0
+
     return df
 
 
-def safe_div_series(a: pd.Series, b: pd.Series) -> pd.Series:
-    out = a / b
-    out = out.replace([np.inf, -np.inf], np.nan)
-    return out
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_multi_price_history(tickers: tuple, period: str = "1y") -> pd.DataFrame:
+    try:
+        data = yf.download(
+            list(tickers),
+            period=period,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True
+        )
+
+        if data.empty:
+            return pd.DataFrame()
+
+        frames = []
+
+        # Multiple tickers
+        if isinstance(data.columns, pd.MultiIndex):
+            for ticker in tickers:
+                try:
+                    sub = data[ticker].copy().reset_index()
+                    if "Close" not in sub.columns:
+                        continue
+                    sub = sub[["Date", "Close"]].copy()
+                    sub["Ticker"] = ticker
+                    sub["Date"] = pd.to_datetime(sub["Date"]).dt.tz_localize(None)
+                    frames.append(sub)
+                except Exception:
+                    continue
+        else:
+            # Single ticker fallback
+            sub = data.reset_index()[["Date", "Close"]].copy()
+            sub["Ticker"] = tickers[0]
+            sub["Date"] = pd.to_datetime(sub["Date"]).dt.tz_localize(None)
+            frames.append(sub)
+
+        if not frames:
+            return pd.DataFrame()
+
+        out = pd.concat(frames, ignore_index=True)
+        return out
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_relative_price_df(price_df: pd.DataFrame) -> pd.DataFrame:
+    if price_df.empty:
+        return price_df
+
+    frames = []
+    for ticker, grp in price_df.groupby("Ticker"):
+        g = grp.sort_values("Date").copy()
+        first_close = g["Close"].dropna()
+        if first_close.empty:
+            continue
+        base = first_close.iloc[0]
+        if pd.isna(base) or base == 0:
+            continue
+
+        g["RelativePrice"] = g["Close"] / base * 100.0
+        g["RollingMax"] = g["Close"].cummax()
+        g["Drawdown"] = g["Close"] / g["RollingMax"] - 1.0
+        frames.append(g)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
 
 
 def get_history_metrics(ticker: str, period: str = "1y") -> dict:
@@ -139,7 +222,20 @@ def get_history_metrics(ticker: str, period: str = "1y") -> dict:
             }
 
         close = hist["Close"].dropna()
-        price = close.iloc[-1]
+        if close.empty:
+            return {
+                "price": np.nan,
+                "ret_1m": np.nan,
+                "ret_3m": np.nan,
+                "ret_6m": np.nan,
+                "ret_12m": np.nan,
+                "vol_1y": np.nan,
+                "mdd_1y": np.nan,
+                "dist_from_52w_high": np.nan,
+                "dist_from_200dma": np.nan,
+            }
+
+        price = float(close.iloc[-1])
 
         def pct_return(days: int):
             if len(close) <= days:
@@ -222,9 +318,6 @@ def get_mva_metrics(ticker: str) -> dict:
     high_52w = hist["Close"].tail(252).max()
     discount_52w_high = safe_div(price - high_52w, high_52w)
 
-    # MVA score logic:
-    # More negative deviation from MA200 and 52W high = relatively cheaper
-    # Too far below MA200 can still be risky, so keep score moderate
     score = 50.0
 
     if pd.notna(dev_ma200):
@@ -454,7 +547,7 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
     ]
     for col in pct_cols:
         if col in out.columns:
-            out[col] = out[col] * 100
+            out[col] = out[col] * 100.0
 
     numeric_cols = out.select_dtypes(include=[np.number]).columns
     out[numeric_cols] = out[numeric_cols].round(2)
@@ -473,7 +566,7 @@ if "last_update" not in st.session_state:
 # Refresh
 # =========================================================
 if refresh_btn or st.session_state.result_df is None:
-    with st.spinner("Fetching latest market data and MVA metrics..."):
+    with st.spinner("Fetching latest market data and factor metrics..."):
         result_df = run_quant_screen(top_n=top_n)
         st.session_state.result_df = result_df
         st.session_state.last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -481,27 +574,33 @@ if refresh_btn or st.session_state.result_df is None:
 raw_df = st.session_state.result_df.copy()
 display_df = format_display_df(raw_df)
 
-filtered_df = display_df.copy()
+filtered_raw_df = raw_df.copy()
+filtered_display_df = display_df.copy()
+
 if show_only_undervalued:
-    filtered_df = filtered_df[filtered_df["style_label"] == "Undervalued Quality"].reset_index(drop=True)
+    mask = filtered_raw_df["style_label"] == "Undervalued Quality"
+    filtered_raw_df = filtered_raw_df[mask].reset_index(drop=True)
+    filtered_display_df = filtered_display_df[mask].reset_index(drop=True)
 
 # =========================================================
-# Top summary
+# Summary
 # =========================================================
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Universe Candidates", len(CANDIDATES))
 c2.metric("Top N Selected", len(raw_df))
-c3.metric("Displayed Rows", len(filtered_df))
+c3.metric("Displayed Rows", len(filtered_display_df))
 c4.metric("Last Update", st.session_state.last_update if st.session_state.last_update else "-")
 
 # =========================================================
-# Horizontal tabs on main screen
+# Main Tabs
 # =========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Dashboard",
     "Market Cap Top10",
     "Quant Analysis",
     "Factor Analysis",
+    "Relative Price",
+    "MDD Analysis",
     "Single Stock Analysis"
 ])
 
@@ -515,18 +614,22 @@ with tab1:
         "rank", "ticker", "short_name", "market_cap", "price",
         "quant_score", "style_label", "mva_score", "mva_label"
     ]
-    st.dataframe(filtered_df[top_cols], use_container_width=True, hide_index=True)
+    st.dataframe(filtered_display_df[top_cols], use_container_width=True, hide_index=True)
 
-    fig = px.bar(
-        filtered_df.sort_values("quant_score", ascending=True),
-        x="quant_score",
-        y="ticker",
-        orientation="h",
-        hover_data=["short_name", "style_label", "mva_score", "mva_label"],
-        title="Quant Score Ranking"
-    )
-    fig.update_layout(height=500)
-    st.plotly_chart(fig, use_container_width=True)
+    chart_df = filtered_display_df.dropna(subset=["quant_score"]).copy()
+    if chart_df.empty:
+        st.warning("No valid data available for dashboard chart.")
+    else:
+        fig = px.bar(
+            chart_df.sort_values("quant_score", ascending=True),
+            x="quant_score",
+            y="ticker",
+            orientation="h",
+            hover_data=["short_name", "style_label", "mva_score", "mva_label"],
+            title="Quant Score Ranking"
+        )
+        fig.update_layout(height=500)
+        st.plotly_chart(fig, use_container_width=True)
 
 # =========================================================
 # Tab 2: Market Cap Top10
@@ -534,22 +637,26 @@ with tab1:
 with tab2:
     st.subheader("Latest Market Cap Ranking")
 
-    mc_view = filtered_df.sort_values("market_cap", ascending=False).reset_index(drop=True)
+    mc_view = filtered_display_df.sort_values("market_cap", ascending=False).reset_index(drop=True)
     mc_view.index = mc_view.index + 1
+
     st.dataframe(
         mc_view[["ticker", "short_name", "market_cap", "price", "quant_score", "mva_score", "mva_label"]],
         use_container_width=True
     )
 
-    fig_mc = px.bar(
-        mc_view,
-        x="market_cap",
-        y="ticker",
-        orientation="h",
-        title="Market Cap Ranking"
-    )
-    fig_mc.update_layout(height=500)
-    st.plotly_chart(fig_mc, use_container_width=True)
+    if mc_view.empty:
+        st.warning("No valid market cap data available.")
+    else:
+        fig_mc = px.bar(
+            mc_view,
+            x="market_cap",
+            y="ticker",
+            orientation="h",
+            title="Market Cap Ranking"
+        )
+        fig_mc.update_layout(height=500)
+        st.plotly_chart(fig_mc, use_container_width=True)
 
 # =========================================================
 # Tab 3: Quant Analysis
@@ -562,87 +669,166 @@ with tab3:
     ])
 
     with qtab1:
-        fig_val = px.scatter(
-            filtered_df,
-            x="forward_pe",
-            y="peg_ratio",
-            size="market_cap",
-            text="ticker",
-            hover_data=["quant_score", "style_label"],
-            title="Forward PE vs PEG Ratio"
-        )
-        fig_val.update_traces(textposition="top center")
-        st.plotly_chart(fig_val, use_container_width=True)
+        st.markdown("### Value Analysis")
+
+        value_df = filtered_raw_df.copy()
+        needed_cols = ["ticker", "market_cap", "forward_pe", "peg_ratio", "quant_score", "style_label"]
+        for col in needed_cols:
+            if col not in value_df.columns:
+                value_df[col] = np.nan
+
+        value_df = value_df.replace([np.inf, -np.inf], np.nan)
+        value_df = value_df.dropna(subset=["forward_pe", "peg_ratio", "market_cap"])
+
+        if value_df.empty:
+            st.warning("No valid data available for Value chart. (forward_pe / peg_ratio missing)")
+        else:
+            fig_val = px.scatter(
+                value_df,
+                x="forward_pe",
+                y="peg_ratio",
+                size="market_cap",
+                text="ticker",
+                hover_data=["quant_score", "style_label"],
+                title="Forward PE vs PEG Ratio"
+            )
+            fig_val.update_traces(textposition="top center")
+            fig_val.update_layout(height=500)
+            st.plotly_chart(fig_val, use_container_width=True)
+
+            value_table = format_display_df(value_df)
+            st.dataframe(
+                value_table[["ticker", "forward_pe", "peg_ratio", "quant_score", "style_label"]],
+                use_container_width=True,
+                hide_index=True
+            )
 
     with qtab2:
-        fig_q = px.bar(
-            filtered_df,
-            x="ticker",
-            y="roe",
-            title="ROE (%)"
-        )
-        st.plotly_chart(fig_q, use_container_width=True)
+        st.markdown("### Quality Analysis")
+
+        quality_df = filtered_raw_df.copy()
+        quality_df = quality_df.replace([np.inf, -np.inf], np.nan)
+        quality_df = quality_df.dropna(subset=["roe"])
+
+        if quality_df.empty:
+            st.warning("No valid data available for Quality chart.")
+        else:
+            quality_plot = format_display_df(quality_df)
+            fig_q = px.bar(
+                quality_plot,
+                x="ticker",
+                y="roe",
+                title="ROE (%)"
+            )
+            fig_q.update_layout(height=500)
+            st.plotly_chart(fig_q, use_container_width=True)
 
     with qtab3:
-        fig_g = px.bar(
-            filtered_df,
-            x="ticker",
-            y="revenue_growth",
-            title="Revenue Growth (%)"
-        )
-        st.plotly_chart(fig_g, use_container_width=True)
+        st.markdown("### Growth Analysis")
+
+        growth_df = filtered_raw_df.copy()
+        growth_df = growth_df.replace([np.inf, -np.inf], np.nan)
+        growth_df = growth_df.dropna(subset=["revenue_growth"])
+
+        if growth_df.empty:
+            st.warning("No valid data available for Growth chart.")
+        else:
+            growth_plot = format_display_df(growth_df)
+            fig_g = px.bar(
+                growth_plot,
+                x="ticker",
+                y="revenue_growth",
+                title="Revenue Growth (%)"
+            )
+            fig_g.update_layout(height=500)
+            st.plotly_chart(fig_g, use_container_width=True)
 
     with qtab4:
-        fig_s = px.bar(
-            filtered_df,
-            x="ticker",
-            y="mdd_1y",
-            title="1Y Max Drawdown (%)"
-        )
-        st.plotly_chart(fig_s, use_container_width=True)
+        st.markdown("### Stability Analysis")
+
+        stability_df = filtered_raw_df.copy()
+        stability_df = stability_df.replace([np.inf, -np.inf], np.nan)
+        stability_df = stability_df.dropna(subset=["mdd_1y"])
+
+        if stability_df.empty:
+            st.warning("No valid data available for Stability chart.")
+        else:
+            stability_plot = format_display_df(stability_df)
+            fig_s = px.bar(
+                stability_plot,
+                x="ticker",
+                y="mdd_1y",
+                title="1Y Max Drawdown (%)"
+            )
+            fig_s.update_layout(height=500)
+            st.plotly_chart(fig_s, use_container_width=True)
 
     with qtab5:
-        fig_m = px.scatter(
-            filtered_df,
-            x="ret_6m",
-            y="ret_12m",
-            size="market_cap",
-            text="ticker",
-            hover_data=["quant_score", "style_label"],
-            title="6M Return vs 12M Return"
-        )
-        fig_m.update_traces(textposition="top center")
-        st.plotly_chart(fig_m, use_container_width=True)
+        st.markdown("### Momentum Analysis")
+
+        momentum_df = filtered_raw_df.copy()
+        needed_cols = ["ticker", "market_cap", "ret_6m", "ret_12m", "quant_score", "style_label"]
+        for col in needed_cols:
+            if col not in momentum_df.columns:
+                momentum_df[col] = np.nan
+
+        momentum_df = momentum_df.replace([np.inf, -np.inf], np.nan)
+        momentum_df = momentum_df.dropna(subset=["ret_6m", "ret_12m", "market_cap"])
+
+        if momentum_df.empty:
+            st.warning("No valid data available for Momentum chart. (ret_6m / ret_12m missing)")
+        else:
+            momentum_plot = format_display_df(momentum_df)
+            fig_m = px.scatter(
+                momentum_plot,
+                x="ret_6m",
+                y="ret_12m",
+                size="market_cap",
+                text="ticker",
+                hover_data=["quant_score", "style_label"],
+                title="6M Return vs 12M Return (%)"
+            )
+            fig_m.update_traces(textposition="top center")
+            fig_m.update_layout(height=500)
+            st.plotly_chart(fig_m, use_container_width=True)
+
+            st.dataframe(
+                momentum_plot[["ticker", "ret_6m", "ret_12m", "quant_score", "style_label"]],
+                use_container_width=True,
+                hide_index=True
+            )
 
     with qtab6:
         st.markdown("### MVA-Based Price Valuation")
-        st.markdown(
-            """
-- **Dev MA50 / MA200 < 0**: current price is below moving average  
-- **More negative value** can imply a cheaper entry zone  
-- **MVA Score** estimates whether price looks relatively cheap or extended  
-            """
-        )
 
-        fig_mva = px.scatter(
-            filtered_df,
-            x="dev_ma200",
-            y="discount_52w_high",
-            size="market_cap",
-            color="mva_score",
-            text="ticker",
-            hover_data=["price", "mva_score", "mva_label", "dev_ma50"],
-            title="Deviation from MA200 vs Discount from 52W High"
-        )
-        fig_mva.update_traces(textposition="top center")
-        st.plotly_chart(fig_mva, use_container_width=True)
+        mva_df = filtered_raw_df.copy()
+        mva_df = mva_df.replace([np.inf, -np.inf], np.nan)
+        mva_df = mva_df.dropna(subset=["dev_ma200", "discount_52w_high", "market_cap", "mva_score"])
 
-        mva_cols = [
-            "ticker", "price", "ma20", "ma50", "ma200",
-            "dev_ma20", "dev_ma50", "dev_ma200",
-            "discount_52w_high", "mva_score", "mva_label"
-        ]
-        st.dataframe(filtered_df[mva_cols], use_container_width=True, hide_index=True)
+        if mva_df.empty:
+            st.warning("No valid data available for MVA chart.")
+        else:
+            mva_plot = format_display_df(mva_df)
+            fig_mva = px.scatter(
+                mva_plot,
+                x="dev_ma200",
+                y="discount_52w_high",
+                size="market_cap",
+                color="mva_score",
+                text="ticker",
+                hover_data=["price", "mva_score", "mva_label", "dev_ma50"],
+                title="Deviation from MA200 vs Discount from 52W High (%)"
+            )
+            fig_mva.update_traces(textposition="top center")
+            fig_mva.update_layout(height=550)
+            st.plotly_chart(fig_mva, use_container_width=True)
+
+            mva_cols = [
+                "ticker", "price", "ma20", "ma50", "ma200",
+                "dev_ma20", "dev_ma50", "dev_ma200",
+                "discount_52w_high", "mva_score", "mva_label"
+            ]
+            st.dataframe(mva_plot[mva_cols], use_container_width=True, hide_index=True)
 
 # =========================================================
 # Tab 4: Factor Analysis
@@ -650,49 +836,183 @@ with tab3:
 with tab4:
     st.subheader("Factor Comparison")
 
+    factor_df = filtered_raw_df.copy().replace([np.inf, -np.inf], np.nan)
+
     left, right = st.columns(2)
 
     with left:
-        fig1 = px.scatter(
-            filtered_df,
-            x="value_score",
-            y="quality_score",
-            size="market_cap",
-            text="ticker",
-            hover_data=["quant_score", "style_label"],
-            title="Value vs Quality"
-        )
-        fig1.update_traces(textposition="top center")
-        st.plotly_chart(fig1, use_container_width=True)
+        df1 = factor_df.dropna(subset=["value_score", "quality_score", "market_cap"])
+        if df1.empty:
+            st.warning("No valid data for Value vs Quality chart.")
+        else:
+            fig1 = px.scatter(
+                df1,
+                x="value_score",
+                y="quality_score",
+                size="market_cap",
+                text="ticker",
+                hover_data=["quant_score", "style_label"],
+                title="Value vs Quality"
+            )
+            fig1.update_traces(textposition="top center")
+            st.plotly_chart(fig1, use_container_width=True)
 
     with right:
-        fig2 = px.scatter(
-            filtered_df,
-            x="growth_score",
-            y="stability_score",
-            size="market_cap",
-            text="ticker",
-            hover_data=["quant_score", "style_label"],
-            title="Growth vs Stability"
-        )
-        fig2.update_traces(textposition="top center")
-        st.plotly_chart(fig2, use_container_width=True)
+        df2 = factor_df.dropna(subset=["growth_score", "stability_score", "market_cap"])
+        if df2.empty:
+            st.warning("No valid data for Growth vs Stability chart.")
+        else:
+            fig2 = px.scatter(
+                df2,
+                x="growth_score",
+                y="stability_score",
+                size="market_cap",
+                text="ticker",
+                hover_data=["quant_score", "style_label"],
+                title="Growth vs Stability"
+            )
+            fig2.update_traces(textposition="top center")
+            st.plotly_chart(fig2, use_container_width=True)
 
 # =========================================================
-# Tab 5: Single Stock Analysis
+# Tab 5: Relative Price
 # =========================================================
 with tab5:
+    st.subheader("Relative Price Comparison")
+
+    tickers_for_chart = tuple(filtered_raw_df["ticker"].tolist())
+
+    if len(tickers_for_chart) == 0:
+        st.warning("No tickers available for relative price comparison.")
+    else:
+        multi_price = get_multi_price_history(tickers_for_chart, period=chart_period)
+        rel_df = build_relative_price_df(multi_price)
+
+        if rel_df.empty:
+            st.warning("Could not load multi-stock price data.")
+        else:
+            fig_rel = px.line(
+                rel_df,
+                x="Date",
+                y="RelativePrice",
+                color="Ticker",
+                title=f"Normalized Price Comparison ({chart_period}, start=100)"
+            )
+            fig_rel.update_layout(height=600, yaxis_title="Relative Price (Start = 100)")
+            st.plotly_chart(fig_rel, use_container_width=True)
+
+            last_rel = (
+                rel_df.sort_values("Date")
+                .groupby("Ticker", as_index=False)
+                .tail(1)[["Ticker", "RelativePrice", "Drawdown"]]
+                .copy()
+            )
+            last_rel["Drawdown"] = (last_rel["Drawdown"] * 100).round(2)
+            last_rel["RelativePrice"] = last_rel["RelativePrice"].round(2)
+
+            st.markdown("### Current Relative Position")
+            st.dataframe(
+                last_rel.sort_values("RelativePrice"),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.markdown(
+                """
+- **Relative Price = 100** means same as starting point  
+- **Below 100** means the stock is below its own starting-period level  
+- This helps identify which top market-cap stocks have fallen more, relatively
+                """
+            )
+
+# =========================================================
+# Tab 6: MDD Analysis
+# =========================================================
+with tab6:
+    st.subheader("MDD Analysis")
+
+    mdd_tab1, mdd_tab2 = st.tabs(["Cross-Section MDD", "Drawdown Curve"])
+
+    with mdd_tab1:
+        mdd_df = filtered_raw_df.copy().replace([np.inf, -np.inf], np.nan)
+        mdd_df = mdd_df.dropna(subset=["mdd_1y"])
+
+        if mdd_df.empty:
+            st.warning("No valid MDD data available.")
+        else:
+            mdd_plot = format_display_df(mdd_df)
+            fig_mdd = px.bar(
+                mdd_plot.sort_values("mdd_1y"),
+                x="mdd_1y",
+                y="ticker",
+                orientation="h",
+                title="1Y Maximum Drawdown Comparison (%)"
+            )
+            fig_mdd.update_layout(height=550, xaxis_title="MDD (%)")
+            st.plotly_chart(fig_mdd, use_container_width=True)
+
+            st.dataframe(
+                mdd_plot[["ticker", "price", "ret_6m", "ret_12m", "mdd_1y", "quant_score", "mva_score"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+    with mdd_tab2:
+        ticker_list = filtered_raw_df["ticker"].tolist()
+        if not ticker_list:
+            st.warning("No ticker available.")
+        else:
+            selected_dd_ticker = st.selectbox(
+                "Select a ticker for drawdown curve",
+                options=ticker_list,
+                key="drawdown_curve_ticker"
+            )
+
+            dd_hist = get_price_history(selected_dd_ticker, period="2y")
+            dd_hist = add_moving_averages(dd_hist)
+
+            if dd_hist.empty or "Drawdown" not in dd_hist.columns:
+                st.warning("Could not load drawdown curve.")
+            else:
+                dd_plot = dd_hist.copy()
+                dd_plot["DrawdownPct"] = dd_plot["Drawdown"] * 100.0
+
+                fig_dd = px.line(
+                    dd_plot,
+                    x="Date",
+                    y="DrawdownPct",
+                    title=f"{selected_dd_ticker} Drawdown Curve (%)"
+                )
+                fig_dd.update_layout(height=500, yaxis_title="Drawdown (%)")
+                st.plotly_chart(fig_dd, use_container_width=True)
+
+                st.dataframe(
+                    pd.DataFrame({
+                        "Metric": ["Current Drawdown (%)", "Worst Drawdown (%)"],
+                        "Value": [
+                            round(dd_plot["DrawdownPct"].iloc[-1], 2),
+                            round(dd_plot["DrawdownPct"].min(), 2)
+                        ]
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+# =========================================================
+# Tab 7: Single Stock Analysis
+# =========================================================
+with tab7:
     st.subheader("Single Stock Analysis")
 
-    ticker_list = display_df["ticker"].tolist() if not display_df.empty else []
-    selected_ticker = st.selectbox("Select a ticker", options=ticker_list)
+    ticker_list = filtered_raw_df["ticker"].tolist() if not filtered_raw_df.empty else []
+    selected_ticker = st.selectbox("Select a ticker", options=ticker_list, key="single_stock_ticker")
 
     if selected_ticker:
         hist = get_price_history(selected_ticker, period="2y")
         hist = add_moving_averages(hist)
 
         if not hist.empty:
-            last_row_df = raw_df[raw_df["ticker"] == selected_ticker]
+            last_row_df = filtered_raw_df[filtered_raw_df["ticker"] == selected_ticker]
             if not last_row_df.empty:
                 stock_info = last_row_df.iloc[0]
 
@@ -731,15 +1051,15 @@ with tab5:
             )
             st.plotly_chart(fig_dev, use_container_width=True)
 
-            st.markdown("### MVA Interpretation")
-            st.markdown(
-                """
-- **Below MA200** and **far from 52W high**: can indicate a relatively cheaper zone  
-- **Far above MA50 / MA200**: often means the stock is extended, not cheap  
-- **MVA Score is not intrinsic valuation**  
-  it is a **price-location indicator** to judge whether entry timing looks expensive or discounted
-                """
+            hist["DrawdownPct"] = hist["Drawdown"] * 100.0
+            fig_dd_single = px.line(
+                hist,
+                x="Date",
+                y="DrawdownPct",
+                title=f"{selected_ticker} Drawdown Curve (%)"
             )
+            fig_dd_single.update_layout(height=420, yaxis_title="Drawdown (%)")
+            st.plotly_chart(fig_dd_single, use_container_width=True)
 
             latest = hist.iloc[-1]
             summary_df = pd.DataFrame({
@@ -749,7 +1069,9 @@ with tab5:
                     "MA50",
                     "MA200",
                     "Price vs MA50 (%)",
-                    "Price vs MA200 (%)"
+                    "Price vs MA200 (%)",
+                    "Current Drawdown (%)",
+                    "Worst Drawdown (%)"
                 ],
                 "Value": [
                     round(latest["Close"], 2) if pd.notna(latest["Close"]) else np.nan,
@@ -758,6 +1080,8 @@ with tab5:
                     round(latest["MA200"], 2) if pd.notna(latest["MA200"]) else np.nan,
                     round(latest["Dev_MA50"] * 100, 2) if pd.notna(latest["Dev_MA50"]) else np.nan,
                     round(latest["Dev_MA200"] * 100, 2) if pd.notna(latest["Dev_MA200"]) else np.nan,
+                    round(latest["Drawdown"] * 100, 2) if pd.notna(latest["Drawdown"]) else np.nan,
+                    round(hist["Drawdown"].min() * 100, 2) if pd.notna(hist["Drawdown"].min()) else np.nan,
                 ]
             })
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
@@ -768,11 +1092,11 @@ with tab5:
 # Download
 # =========================================================
 st.markdown("---")
-csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
+csv_data = filtered_display_df.to_csv(index=False).encode("utf-8-sig")
 st.download_button(
     label="📥 Download Current Table as CSV",
     data=csv_data,
-    file_name="nasdaq_quant_mva_screener.csv",
+    file_name="nasdaq_quant_mva_mdd_screener.csv",
     mime="text/csv",
     use_container_width=True
 )

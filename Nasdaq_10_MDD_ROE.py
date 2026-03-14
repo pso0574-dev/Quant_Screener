@@ -4,7 +4,7 @@
 # ROE / MDD based undervalued stock screening
 # + strategy tabs
 # + Top 10 MVA analysis
-# + unique keys for Streamlit charts/widgets
+# + MVA charts listed sequentially (no selectbox)
 #
 # Install:
 #   pip install streamlit yfinance pandas numpy plotly
@@ -162,14 +162,12 @@ def load_fundamentals(tickers):
 
 def get_close_series(price_data, ticker):
     try:
-        # MultiIndex columns when multiple tickers are downloaded
         if isinstance(price_data.columns, pd.MultiIndex):
             if ticker in price_data.columns.get_level_values(0):
                 s = price_data[ticker]["Close"].dropna()
             else:
                 s = pd.Series(dtype=float)
         else:
-            # single ticker fallback
             if "Close" in price_data.columns:
                 s = price_data["Close"].dropna()
             else:
@@ -239,12 +237,10 @@ def compute_technical_features(price_data, tickers):
 # Ranking / scoring helpers
 # ============================================================
 def rank_high(series):
-    # Higher value is better
     return series.rank(pct=True, ascending=True)
 
 
 def rank_low(series):
-    # Lower value is better
     return 1 - series.rank(pct=True, ascending=True)
 
 
@@ -252,7 +248,6 @@ def build_scores(df):
     df = df.copy()
     df = df.replace([np.inf, -np.inf], np.nan)
 
-    # Higher is favorable
     df["r_ROE"] = rank_high(df["ROE"])
     df["r_GrossMargin"] = rank_high(df["GrossMargin"])
     df["r_OpMargin"] = rank_high(df["OperatingMargin"])
@@ -260,20 +255,16 @@ def build_scores(df):
     df["r_Mom6"] = rank_high(df["Momentum_6M"])
     df["r_FCF"] = rank_high(df["FCF_B"])
 
-    # Lower is favorable
-    # More negative MDD should rank better for undervaluation/pullback
     df["r_MDD"] = rank_low(df["MDD"])
     df["r_Debt"] = rank_low(df["DebtToEquity"])
     df["r_Vol"] = rank_low(df["Volatility_1Y"])
     df["r_PE"] = rank_low(df["ForwardPE"].fillna(df["TrailingPE"]))
 
-    # Strategy 1: ROE + MDD
     df["Score_ROE_MDD"] = (
         0.60 * df["r_ROE"] +
         0.40 * df["r_MDD"]
     )
 
-    # Strategy 2: Quality + Pullback
     df["Score_Quality_Pullback"] = (
         0.30 * df["r_ROE"] +
         0.20 * df["r_GrossMargin"] +
@@ -282,7 +273,6 @@ def build_scores(df):
         0.15 * df["r_Debt"]
     )
 
-    # Strategy 3: Recovery Momentum
     df["Score_Recovery_Momentum"] = (
         0.30 * df["r_ROE"] +
         0.30 * df["r_MDD"] +
@@ -290,7 +280,6 @@ def build_scores(df):
         0.15 * df["r_RevenueGrowth"]
     )
 
-    # Strategy 4: Low Vol Pullback
     df["Score_LowVol_Pullback"] = (
         0.30 * df["r_ROE"] +
         0.30 * df["r_MDD"] +
@@ -344,7 +333,7 @@ def styled_table(df):
     format_dict = {}
 
     for col in df.columns:
-        if col in ["Ticker"]:
+        if col == "Ticker":
             continue
         elif col in ["MarketCap_B", "FCF_B", "Price", "MA50", "MA100", "MA200"]:
             format_dict[col] = "{:.2f}"
@@ -402,7 +391,7 @@ def plot_mva_chart(price_data, ticker, chart_key):
         title=f"{ticker} Price vs Moving Averages",
         xaxis_title="Date",
         yaxis_title="Price",
-        height=450,
+        height=420,
         legend_orientation="h",
         margin=dict(l=20, r=20, t=60, b=20),
     )
@@ -430,7 +419,7 @@ def plot_top10_mva_distance_bar(top_df, title, chart_key):
     )
 
     fig.update_layout(
-        height=450,
+        height=420,
         margin=dict(l=20, r=20, t=60, b=20),
     )
 
@@ -446,7 +435,7 @@ def plot_score_bar(out, score_col, strategy_title, chart_key):
     )
 
     fig.update_layout(
-        height=420,
+        height=400,
         margin=dict(l=20, r=20, t=60, b=20),
     )
 
@@ -465,7 +454,7 @@ def plot_roe_mdd_scatter(out, score_col, strategy_title, chart_key):
     )
 
     fig.update_layout(
-        height=450,
+        height=430,
         margin=dict(l=20, r=20, t=60, b=20),
     )
 
@@ -484,11 +473,37 @@ def plot_overview_scatter(df, chart_key):
     )
 
     fig.update_layout(
-        height=500,
+        height=480,
         margin=dict(l=20, r=20, t=60, b=20),
     )
 
     st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+
+def show_mva_metrics(row):
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Dist from MA50", f"{row['Dist_50MA']:.2f}%")
+    c2.metric("Dist from MA100", f"{row['Dist_100MA']:.2f}%")
+    c3.metric("Dist from MA200", f"{row['Dist_200MA']:.2f}%")
+
+
+def show_all_mva_charts(price_data, out, score_col, section_prefix):
+    st.markdown(f"#### Top {len(out)} Individual MVA Charts")
+
+    for idx, ticker in enumerate(out["Ticker"].tolist(), start=1):
+        row = out[out["Ticker"] == ticker].iloc[0]
+
+        st.markdown(f"##### {idx}. {ticker}")
+        show_mva_metrics(row)
+
+        plot_mva_chart(
+            price_data=price_data,
+            ticker=ticker,
+            chart_key=f"{section_prefix}_{score_col}_{ticker}_mva_chart"
+        )
+
+        if idx < len(out):
+            st.markdown("---")
 
 
 # ============================================================
@@ -527,25 +542,11 @@ def show_strategy_section(df, price_data, score_col, strategy_title, strategy_de
         chart_key=f"{score_col}_mva_distance_bar"
     )
 
-    st.markdown(f"#### Top {top_n} Individual MVA Chart")
-
-    selected_ticker = st.selectbox(
-        f"Select ticker for MVA chart - {strategy_title}",
-        out["Ticker"].tolist(),
-        key=f"select_{score_col}"
-    )
-
-    sel_row = out[out["Ticker"] == selected_ticker].iloc[0]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Dist from MA50", f"{sel_row['Dist_50MA']:.2f}%")
-    c2.metric("Dist from MA100", f"{sel_row['Dist_100MA']:.2f}%")
-    c3.metric("Dist from MA200", f"{sel_row['Dist_200MA']:.2f}%")
-
-    plot_mva_chart(
+    show_all_mva_charts(
         price_data=price_data,
-        ticker=selected_ticker,
-        chart_key=f"{score_col}_{selected_ticker}_mva_chart"
+        out=out,
+        score_col=score_col,
+        section_prefix="strategy"
     )
 
 
@@ -559,7 +560,6 @@ with st.spinner("Loading Nasdaq-100 market data..."):
 
 df = fundamentals_df.merge(technical_df, on="Ticker", how="inner")
 
-# Basic filters
 df = df[
     (df["MarketCap_B"].fillna(0) >= min_mktcap_b) &
     (df["ROE"].fillna(-999) >= min_roe)
@@ -617,23 +617,11 @@ This dashboard uses the **Nasdaq-100 universe** and compares several quant style
         chart_key="overview_mva_distance_bar"
     )
 
-    selected_overview = st.selectbox(
-        "Select ticker for overview MVA chart",
-        best["Ticker"].tolist(),
-        key="overview_select_ticker"
-    )
-
-    selected_row = best[best["Ticker"] == selected_overview].iloc[0]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Dist from MA50", f"{selected_row['Dist_50MA']:.2f}%")
-    c2.metric("Dist from MA100", f"{selected_row['Dist_100MA']:.2f}%")
-    c3.metric("Dist from MA200", f"{selected_row['Dist_200MA']:.2f}%")
-
-    plot_mva_chart(
+    show_all_mva_charts(
         price_data=price_data,
-        ticker=selected_overview,
-        chart_key=f"overview_{selected_overview}_mva_chart"
+        out=best,
+        score_col="Score_ROE_MDD",
+        section_prefix="overview"
     )
 
 

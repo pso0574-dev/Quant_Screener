@@ -6,6 +6,7 @@
 # + Top 10 MVA analysis
 # + MVA charts listed sequentially
 # + simple company description + quant interpretation per stock
+# + Sector filter
 #
 # Install:
 #   pip install streamlit yfinance pandas numpy plotly
@@ -553,6 +554,12 @@ def plot_mva_chart(price_data, ticker, chart_key):
 
 def plot_top10_mva_distance_bar(top_df, title, chart_key):
     needed_cols = ["Ticker", "Dist_50MA", "Dist_100MA", "Dist_200MA"]
+    available_cols = [c for c in needed_cols if c in top_df.columns]
+
+    if len(available_cols) < 4:
+        st.warning("Not enough MVA data to display the bar chart.")
+        return
+
     temp = top_df[needed_cols].copy()
 
     temp = temp.melt(
@@ -693,7 +700,7 @@ def show_strategy_section(df, price_data, score_col, strategy_title, strategy_de
         chart_key=f"{score_col}_roe_mdd_scatter"
     )
 
-    st.markdown(f"#### Top {top_n} MVA Distance Analysis")
+    st.markdown(f"#### Top {len(out)} MVA Distance Analysis")
     plot_top10_mva_distance_bar(
         top_df=out,
         title=f"{strategy_title}: Price Distance from MA50 / MA100 / MA200",
@@ -716,6 +723,20 @@ with st.spinner("Loading Nasdaq-100 market data..."):
     fundamentals_df = load_fundamentals(NASDAQ100_TICKERS)
     technical_df = compute_technical_features(price_data, NASDAQ100_TICKERS)
 
+# ============================================================
+# Sector selector (after fundamentals loaded)
+# ============================================================
+sector_list = sorted(
+    [s for s in fundamentals_df["Sector"].dropna().unique().tolist() if str(s).strip()]
+)
+
+selected_sectors = st.sidebar.multiselect(
+    "Business Sector",
+    options=sector_list,
+    default=[],
+    help="Leave empty to analyze all sectors."
+)
+
 df = fundamentals_df.merge(technical_df, on="Ticker", how="inner")
 
 df = df[
@@ -723,13 +744,21 @@ df = df[
     (df["ROE"].fillna(-999) >= min_roe)
 ].copy()
 
+if selected_sectors:
+    df = df[df["Sector"].isin(selected_sectors)].copy()
+
 df = build_scores(df)
 
 st.subheader("Filtered Universe")
-st.write(f"Number of stocks after filters: **{len(df)}**")
+if selected_sectors:
+    st.write(
+        f"Number of stocks after filters: **{len(df)}**  |  Selected sector(s): **{', '.join(selected_sectors)}**"
+    )
+else:
+    st.write(f"Number of stocks after filters: **{len(df)}**  |  Selected sector(s): **All**")
 
 if df.empty:
-    st.error("No stocks matched the current filter settings. Try lowering the ROE or market cap threshold.")
+    st.error("No stocks matched the current filter settings. Try lowering the ROE / market cap threshold or changing the sector filter.")
     st.stop()
 
 

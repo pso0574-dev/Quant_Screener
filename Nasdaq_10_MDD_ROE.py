@@ -4,7 +4,8 @@
 # ROE / MDD based undervalued stock screening
 # + strategy tabs
 # + Top 10 MVA analysis
-# + MVA charts listed sequentially (no selectbox)
+# + MVA charts listed sequentially
+# + simple company description + quant interpretation per stock
 #
 # Install:
 #   pip install streamlit yfinance pandas numpy plotly
@@ -31,7 +32,9 @@ st.set_page_config(
 )
 
 st.title("📈 Nasdaq-100 Quant Strategy Dashboard")
-st.caption("ROE / MDD based undervalued stock screening with strategy tabs + Top 10 MVA analysis")
+st.caption(
+    "ROE / MDD based undervalued stock screening with strategy tabs + sequential Top 10 MVA analysis"
+)
 
 
 # ============================================================
@@ -88,10 +91,6 @@ min_mktcap_b = st.sidebar.slider(
 
 refresh = st.sidebar.button("Refresh Data")
 
-
-# ============================================================
-# Cache reset
-# ============================================================
 if refresh:
     st.cache_data.clear()
 
@@ -118,20 +117,49 @@ def load_fundamentals(tickers):
 
     for ticker in tickers:
         try:
-            info = yf.Ticker(ticker).info
+            tk = yf.Ticker(ticker)
 
-            roe = info.get("returnOnEquity", np.nan)
-            market_cap = info.get("marketCap", np.nan)
-            trailing_pe = info.get("trailingPE", np.nan)
-            forward_pe = info.get("forwardPE", np.nan)
-            gross_margin = info.get("grossMargins", np.nan)
-            operating_margin = info.get("operatingMargins", np.nan)
-            revenue_growth = info.get("revenueGrowth", np.nan)
-            debt_to_equity = info.get("debtToEquity", np.nan)
-            free_cashflow = info.get("freeCashflow", np.nan)
+            short_name = ticker
+            sector = ""
+            industry = ""
+            business_summary = ""
+            roe = np.nan
+            market_cap = np.nan
+            trailing_pe = np.nan
+            forward_pe = np.nan
+            gross_margin = np.nan
+            operating_margin = np.nan
+            revenue_growth = np.nan
+            debt_to_equity = np.nan
+            free_cashflow = np.nan
+
+            try:
+                info = tk.info
+            except Exception:
+                info = {}
+
+            if isinstance(info, dict) and len(info) > 0:
+                short_name = info.get("shortName", ticker)
+                sector = info.get("sector", "")
+                industry = info.get("industry", "")
+                business_summary = info.get("longBusinessSummary", "")
+
+                roe = info.get("returnOnEquity", np.nan)
+                market_cap = info.get("marketCap", np.nan)
+                trailing_pe = info.get("trailingPE", np.nan)
+                forward_pe = info.get("forwardPE", np.nan)
+                gross_margin = info.get("grossMargins", np.nan)
+                operating_margin = info.get("operatingMargins", np.nan)
+                revenue_growth = info.get("revenueGrowth", np.nan)
+                debt_to_equity = info.get("debtToEquity", np.nan)
+                free_cashflow = info.get("freeCashflow", np.nan)
 
             rows.append({
                 "Ticker": ticker,
+                "ShortName": short_name,
+                "Sector": sector,
+                "Industry": industry,
+                "BusinessSummary": business_summary,
                 "ROE": roe * 100 if pd.notna(roe) else np.nan,
                 "MarketCap_B": market_cap / 1e9 if pd.notna(market_cap) else np.nan,
                 "TrailingPE": trailing_pe,
@@ -146,6 +174,10 @@ def load_fundamentals(tickers):
         except Exception:
             rows.append({
                 "Ticker": ticker,
+                "ShortName": ticker,
+                "Sector": "",
+                "Industry": "",
+                "BusinessSummary": "",
                 "ROE": np.nan,
                 "MarketCap_B": np.nan,
                 "TrailingPE": np.nan,
@@ -293,6 +325,10 @@ def build_scores(df):
 def top_table(df, score_col, top_n=10):
     cols = [
         "Ticker",
+        "ShortName",
+        "Sector",
+        "Industry",
+        "BusinessSummary",
         "ROE",
         "MDD",
         "Momentum_3M",
@@ -333,7 +369,7 @@ def styled_table(df):
     format_dict = {}
 
     for col in df.columns:
-        if col == "Ticker":
+        if col in ["Ticker", "ShortName", "Sector", "Industry", "BusinessSummary"]:
             continue
         elif col in ["MarketCap_B", "FCF_B", "Price", "MA50", "MA100", "MA200"]:
             format_dict[col] = "{:.2f}"
@@ -343,6 +379,122 @@ def styled_table(df):
             format_dict[col] = "{:.2f}"
 
     return df.style.format(format_dict)
+
+
+def safe_text(val, default="-"):
+    if val is None:
+        return default
+    if isinstance(val, float) and pd.isna(val):
+        return default
+    text = str(val).strip()
+    return text if text else default
+
+
+def summarize_business(text, max_len=220):
+    if not isinstance(text, str) or not text.strip():
+        return "Business description not available."
+    text = text.strip().replace("\n", " ")
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rsplit(" ", 1)[0] + "..."
+
+
+# ============================================================
+# Interpretation helpers
+# ============================================================
+def interpret_mva(dist50, dist100, dist200):
+    if pd.notna(dist50) and pd.notna(dist100) and pd.notna(dist200):
+        if dist50 > 0 and dist100 > 0 and dist200 > 0:
+            return "Price is above MA50, MA100, and MA200, which suggests a relatively strong trend."
+        if dist50 > 0 and dist100 > 0 and dist200 < 0:
+            return "Short- and mid-term recovery is visible, but the stock is still below its long-term trend."
+        if dist50 > 0 and dist200 < 0:
+            return "Short-term recovery is visible, but the stock remains below MA200."
+        if dist50 < 0 and dist100 < 0 and dist200 < 0:
+            return "Price is below all major moving averages, which suggests a weak technical trend."
+        if dist200 < 0:
+            return "The stock remains below MA200, so it may still be in a discounted long-term zone."
+    return "Technical positioning is mixed across moving averages."
+
+
+def interpret_quant_style(row, score_col):
+    roe = row.get("ROE", np.nan)
+    mdd = row.get("MDD", np.nan)
+    mom6 = row.get("Momentum_6M", np.nan)
+    vol = row.get("Volatility_1Y", np.nan)
+    rev = row.get("RevenueGrowth", np.nan)
+    debt = row.get("DebtToEquity", np.nan)
+
+    comments = []
+
+    if pd.notna(roe):
+        if roe >= 20:
+            comments.append("high profitability")
+        elif roe >= 10:
+            comments.append("decent profitability")
+        else:
+            comments.append("weaker profitability")
+
+    if pd.notna(mdd):
+        if mdd <= -30:
+            comments.append("deep drawdown")
+        elif mdd <= -15:
+            comments.append("meaningful pullback")
+        else:
+            comments.append("limited drawdown")
+
+    if score_col == "Score_Recovery_Momentum":
+        if pd.notna(mom6):
+            if mom6 > 10:
+                comments.append("clear recovery momentum")
+            elif mom6 > 0:
+                comments.append("mild recovery momentum")
+            else:
+                comments.append("weak recent momentum")
+
+        if pd.notna(rev):
+            if rev > 10:
+                comments.append("solid revenue growth")
+            elif rev < 0:
+                comments.append("negative revenue growth")
+
+    if score_col == "Score_LowVol_Pullback":
+        if pd.notna(vol):
+            if vol < 25:
+                comments.append("relatively stable volatility")
+            else:
+                comments.append("still volatile")
+
+    if score_col == "Score_Quality_Pullback":
+        if pd.notna(debt):
+            if debt < 50:
+                comments.append("manageable leverage")
+            elif debt > 150:
+                comments.append("higher leverage")
+
+    if not comments:
+        return "Quant interpretation is limited due to missing data."
+
+    return " / ".join(comments).capitalize() + "."
+
+
+def show_stock_description(row, score_col):
+    ticker = safe_text(row.get("Ticker"))
+    short_name = safe_text(row.get("ShortName"), ticker)
+    sector = safe_text(row.get("Sector"))
+    industry = safe_text(row.get("Industry"))
+    summary = summarize_business(row.get("BusinessSummary", ""))
+    quant_comment = interpret_quant_style(row, score_col)
+    mva_comment = interpret_mva(
+        row.get("Dist_50MA", np.nan),
+        row.get("Dist_100MA", np.nan),
+        row.get("Dist_200MA", np.nan),
+    )
+
+    st.markdown(f"**{ticker} — {short_name}**")
+    st.caption(f"Sector: {sector} | Industry: {industry}")
+    st.write(summary)
+    st.info(f"Quant view: {quant_comment} {mva_comment}")
 
 
 # ============================================================
@@ -482,9 +634,14 @@ def plot_overview_scatter(df, chart_key):
 
 def show_mva_metrics(row):
     c1, c2, c3 = st.columns(3)
-    c1.metric("Dist from MA50", f"{row['Dist_50MA']:.2f}%")
-    c2.metric("Dist from MA100", f"{row['Dist_100MA']:.2f}%")
-    c3.metric("Dist from MA200", f"{row['Dist_200MA']:.2f}%")
+
+    d50 = row.get("Dist_50MA", np.nan)
+    d100 = row.get("Dist_100MA", np.nan)
+    d200 = row.get("Dist_200MA", np.nan)
+
+    c1.metric("Dist from MA50", "-" if pd.isna(d50) else f"{d50:.2f}%")
+    c2.metric("Dist from MA100", "-" if pd.isna(d100) else f"{d100:.2f}%")
+    c3.metric("Dist from MA200", "-" if pd.isna(d200) else f"{d200:.2f}%")
 
 
 def show_all_mva_charts(price_data, out, score_col, section_prefix):
@@ -494,6 +651,7 @@ def show_all_mva_charts(price_data, out, score_col, section_prefix):
         row = out[out["Ticker"] == ticker].iloc[0]
 
         st.markdown(f"##### {idx}. {ticker}")
+        show_stock_description(row, score_col)
         show_mva_metrics(row)
 
         plot_mva_chart(
@@ -715,6 +873,8 @@ Useful when you want a more **stable pullback strategy**.
 # ============================================================
 with st.expander("Show raw merged data"):
     st.dataframe(
-        styled_table(df.sort_values("Score_ROE_MDD", ascending=False).reset_index(drop=True)),
+        styled_table(
+            df.sort_values("Score_ROE_MDD", ascending=False).reset_index(drop=True)
+        ),
         use_container_width=True
     )
